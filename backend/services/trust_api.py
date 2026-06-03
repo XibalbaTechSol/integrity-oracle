@@ -594,7 +594,7 @@ async def get_user_agents(db: Session = Depends(get_db), user: dict = Depends(ve
     """Fetch all agents owned by the authenticated user."""
     agents = db.query(Agent).filter(
         Agent.owner_uid == user["uid"],
-        Agent.staked_amount_itk > 0
+        Agent.is_active == True
     ).all()
     
     # Identity Ceiling map: AIS scores are mathematically capped by verification tier

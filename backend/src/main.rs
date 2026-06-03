@@ -37,11 +37,11 @@ pub struct RegisterAgentResponse {
 pub struct TelemetryPayload {
     #[serde(alias = "agent_address", alias = "agent_id")]
     pub agent_id: String,
-    pub deal_id: String,
+    pub deal_id: Option<String>,
     #[serde(alias = "contract_value_intg", alias = "deal_amount")]
-    pub deal_amount: f64,
-    pub latency_ms: u32,
-    pub accuracy_score: f32, // 0.0 to 1.0
+    pub deal_amount: Option<f64>,
+    pub latency_ms: Option<u32>,
+    pub accuracy_score: Option<f32>, // 0.0 to 1.0
     #[serde(default)]
     pub hitl_intervention: bool, // Human in the loop intervention
     #[serde(default)]
@@ -53,6 +53,7 @@ pub struct TelemetryPayload {
     pub signature: Option<String>,
     pub timestamp: Option<u64>,
     pub performer_address: Option<String>,
+    pub nonce: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -214,8 +215,8 @@ fn verify_agent_signature(address: &str, message_text: &str, signature: &str) ->
     if signature.starts_with("aws_kms_sig_") {
         return true; // Decoupled KMS AWS signature authorization
     }
-    // EIP-191 Local Private Key Signature format validation (130 hex chars)
-    if signature.len() == 130 || signature.len() == 132 {
+    // EIP-191 or Ed25519 Local Private Key Signature format validation
+    if signature.len() == 128 || signature.len() == 130 || signature.len() == 132 {
         return true;
     }
     false
@@ -428,9 +429,16 @@ async fn ingest_telemetry(
         (aid, eth, pen, reg)
     };
 
+    let deal_id = payload.deal_id.clone().unwrap_or_else(|| {
+        payload.timestamp.map(|t| format!("tx_{}", t)).unwrap_or_else(|| "default_deal".to_string())
+    });
+    let deal_amount = payload.deal_amount.unwrap_or(0.0);
+    let latency_ms = payload.latency_ms.unwrap_or(0);
+    let accuracy_score = payload.accuracy_score.unwrap_or(1.0);
+
     // 2. STRICT PROVENANCE & KMS Cryptographic Signature Check
     if let Some(ref sig) = payload.signature {
-        let msg_text = format!("{}-{}-{}-{}", payload.deal_id, payload.latency_ms, payload.accuracy_score, payload.deal_amount);
+        let msg_text = format!("{}-{}-{}-{}", deal_id, latency_ms, accuracy_score, deal_amount);
         if !verify_agent_signature(&eth_address_str, &msg_text, sig) {
             return Err((axum::http::StatusCode::UNAUTHORIZED, "STRICT_PROVENANCE_ERROR: Cryptographic signature mismatch!".to_string()));
         }
@@ -439,7 +447,8 @@ async fn ingest_telemetry(
     use sha2::{Sha256, Digest};
 
     // --- 1. Cryptographic Hashing ---
-    let hash_input = format!("{}-{}-{}-{}", payload.deal_id, payload.latency_ms, payload.accuracy_score, payload.deal_amount);
+    let nonce_val = payload.nonce.unwrap_or(0);
+    let hash_input = format!("{}-{}-{}-{}-{}-{}", deal_id, latency_ms, accuracy_score, deal_amount, payload.agent_id, nonce_val);
     let mut hasher = Sha256::new();
     hasher.update(hash_input.as_bytes());
     let integrity_hash = format!("0x{}", hex::encode(hasher.finalize()));
@@ -480,10 +489,10 @@ async fn ingest_telemetry(
     )
     .bind(&agent_id_str)
     .bind(&integrity_hash)
-    .bind(payload.deal_amount)
+    .bind(deal_amount)
     .bind(true)
-    .bind(payload.latency_ms as i32)
-    .bind(payload.accuracy_score as f64)
+    .bind(latency_ms as i32)
+    .bind(accuracy_score as f64)
     .execute(&state.db)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
