@@ -41,6 +41,10 @@ class IntegrityConfig:
     auto_anchor: bool = False
     strict_provenance: bool = False
     timeout: int = 30
+    kms_provider: Optional[str] = None      # e.g. "lit", "aws", "vault"
+    kms_key_id: Optional[str] = None        # Lit PKP Address or AWS Key ARN
+    kms_api_endpoint: Optional[str] = None  # API endpoint for KMS routing
+    kms_auth_token: Optional[str] = None    # API key or OAuth authorization token
 
 
 @dataclass

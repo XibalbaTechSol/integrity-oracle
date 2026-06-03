@@ -52,6 +52,28 @@ pip install xibalba-integrity[openai]
 pip install xibalba-integrity[all]
 ```
 
+## Global CLI (`integrity`)
+
+The Python SDK includes the global `integrity` CLI to manage your node environment:
+```bash
+# Initialize a new project with .integrity.yaml
+integrity init
+
+# Run system diagnostics (Checks Hermes, Backend, Bridge, Web3)
+integrity doctor
+
+# Attempt to auto-fix environmental issues
+integrity doctor --fix
+```
+
+## Genesis Prover (`itk-prover`)
+
+The SDK includes a local Proof of Work (PoW) hash generator to cryptographically sign files or commits:
+```bash
+# Calculate and append an Integrity Checksum to a file
+itk-prover /path/to/walkthrough.md --sign
+```
+
 ## Quick Start
 
 ### 1. Report a Completed Deal
