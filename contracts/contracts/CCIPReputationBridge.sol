@@ -105,12 +105,12 @@ contract CCIPReputationBridge is CCIPReceiver, Ownable {
         // Enforce security checks: must come from the trusted peer bridge on the source chain
         require(sender == trustedBridges[sourceChainSelector], "Sender not trusted");
 
-        (address agent, uint256 aisScore) = abi.decode(any2EvmMessage.data, (address, uint256));
+        (address agent, uint256 aisScore, uint256 tier) = abi.decode(any2EvmMessage.data, (address, uint256, uint256));
 
         // Synchronize on the target registry
-        // Note: Registry contract must grant permission to this bridge to write scores
-        registry.verifyReputationZK("", new bytes32[](0)); // Placeholder or direct state update
+        registry.updateAISByBridge(agent, aisScore, tier);
         
         emit ReputationReceived(any2EvmMessage.messageId, sourceChainSelector, agent, aisScore);
     }
+
 }

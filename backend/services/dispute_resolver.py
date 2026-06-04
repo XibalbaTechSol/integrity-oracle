@@ -3,6 +3,8 @@ import datetime
 from sqlalchemy.orm import Session
 from database import SessionLocal, Agent, TransactionLog
 
+from blockchain_service import IntegrityBlockchainService
+
 class XibalbaDisputeResolver:
     """
     Xibalba Solutions: Dispute Resolution Engine (v2.0)
@@ -11,23 +13,27 @@ class XibalbaDisputeResolver:
     and apply Slashing Penalties ($P_s$) directly to the Trust Vault.
     """
 
-    def trigger_resolution(self, transaction_id: str):
+    def __init__(self):
+        self.blockchain = IntegrityBlockchainService()
+
+    def trigger_resolution(self, log_id: str, deal_id_hex: str = None):
         """
         Main entry point for transaction auditing.
         Requires both provider and customer metadata to be present.
         """
         db = SessionLocal()
         try:
-            tx = db.query(TransactionLog).filter(TransactionLog.transaction_id == transaction_id).first()
+            tx = db.query(TransactionLog).filter(TransactionLog.log_id == log_id).first()
             if not tx:
-                print(f"[!] Error: Transaction {transaction_id} not found.")
+                print(f"[!] Error: Transaction {log_id} not found.")
                 return None
 
             if not tx.provider_metadata or not tx.customer_metadata:
-                print(f"[*] Tx {transaction_id}: Awaiting dual-witness completion.")
+                print(f"[*] Tx {log_id}: Awaiting dual-witness completion.")
                 return {"status": "PENDING"}
 
             # --- Resolution Logic ---
+            transaction_id = str(log_id)
             provider = tx.provider_metadata
             customer = tx.customer_metadata
             
@@ -81,6 +87,11 @@ class XibalbaDisputeResolver:
                 tx.dispute_status = "SLASHED"
                 print(f"[VERDICT] Tx {transaction_id} SLASHED! Penalty: {max_penalty}")
                 print(f"  -> Agent {agent.eth_address} reputation reduced.")
+                
+                # --- On-Chain Slash ---
+                if deal_id_hex:
+                    print(f"[BLOCKCHAIN] Triggering on-chain slash for deal {deal_id_hex}...")
+                    self.blockchain.resolve_dispute_on_chain(deal_id_hex, True)
             
             db.commit()
             

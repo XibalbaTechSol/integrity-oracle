@@ -11,8 +11,26 @@ from data_ingestor import IntegrityDataIngestor
 from dispute_resolver import XibalbaDisputeResolver
 from blockchain_service import IntegrityBlockchainService
 from hermes_gateway import HermesGateway
-from database import SessionLocal, Agent, TransactionLog, Base, engine as db_engine, UserProfile, GlobalSettings, LoanLedger, ContactInquiry, GovernanceProposal
+from database import SessionLocal, Agent, TransactionLog, Base, engine as db_engine, UserProfile, GlobalSettings, LoanLedger, ContactInquiry, GovernanceProposal, MarketTask, AgentEquity, UserContract
 from eth_account import Account
+
+# --- Market Models ---
+
+class MarketTaskCreateRequest(BaseModel):
+    creator_agent_address: str
+    title: str
+    description: str
+    reward_itk: float
+    min_ais_required: int
+
+class MarketTaskBidRequest(BaseModel):
+    task_id: str
+    bidder_agent_address: str
+
+class AgentEquityBuyRequest(BaseModel):
+    agent_address: str
+    shares_percentage: float # 0.0 to 1.0
+    price_itk: float
 from eth_account.messages import encode_defunct
 from fastapi.responses import JSONResponse
 from fastapi.responses import FileResponse
@@ -340,6 +358,45 @@ def initialize_database():
                         )
                         db.add(snapshot)
             db.commit()
+
+            # Seed Governance Proposals if empty
+            from database import GovernanceProposal
+            if db.query(GovernanceProposal).count() == 0:
+                proposals = [
+                    GovernanceProposal(
+                        title="Reduce SLA Performance Buffer",
+                        category="Parameters",
+                        description="Proposal to lower the allowed latency variance buffer from 150ms to 80ms for Tier-3 AAA agents.",
+                        parameter="latency_buffer_ms",
+                        old_value="150",
+                        new_value="80",
+                        risk_level="MEDIUM",
+                        status="ACTIVE"
+                    ),
+                    GovernanceProposal(
+                        title="Increase Slash Tax to 10%",
+                        category="Tokenomics",
+                        description="Increase the penalty slash tax from 5% to 10% to discourage toxic behavior and fund the sovereign insurance pools.",
+                        parameter="slash_tax_rate_bps",
+                        old_value="500",
+                        new_value="1000",
+                        risk_level="HIGH",
+                        status="ACTIVE"
+                    ),
+                    GovernanceProposal(
+                        title="Lower Sovereign Tier Entry",
+                        category="Registry",
+                        description="Decrease required staked ITK for linked Tier-2 agents from 10,000 to 5,000 ITK to encourage onboarding.",
+                        parameter="tier_2_stake_floor",
+                        old_value="10000",
+                        new_value="5000",
+                        risk_level="LOW",
+                        status="ACTIVE"
+                    )
+                ]
+                for p in proposals:
+                    db.add(p)
+                db.commit()
             
             # Seed Hermes Fleet Configs (Master, Alpha, Omega)
             hermes.seed_hermes_fleet()
@@ -467,14 +524,14 @@ async def get_insurance_quote(request: RiskProfileRequest, db: Session = Depends
     scores = engine.calculate_ais(
         avg_partner_ais=500, # Fallback
         xibalba_audit_score=1.0, # Xibalba manual audit weight
-        gpu_hours_verified=float(agent.gpu_hours_verified),
+        gpu_hours_verified=float(agent.gpu_hours_verified or 0.0),
         hgi_raw=agent.grounding_score / 1000.0, # Real HITL weight
         performance_variance=current_entropy,
         staked_ratio=0.5,
         agent_age_days=(datetime.datetime.utcnow().replace(tzinfo=None) - agent.registration_date.replace(tzinfo=None)).days + 1,
         total_volume_intg=float(len(logs)),
         days_since_active=days_since_active,
-        penalty_points=float(agent.penalty_points),
+        penalty_points=float(agent.penalty_points or 0.0),
         verification_tier=agent.verification_tier
     )
     
@@ -573,9 +630,9 @@ async def get_agent_score(identifier: str, db: Session = Depends(get_db)):
         "sacrifice_score": agent.sacrifice_score or 0,
         "compute_score": agent.compute_score or 0,
         "collateral_score": agent.collateral_score or 0,
-        "gpu_hours": float(agent.gpu_hours_verified),
+        "gpu_hours": float(agent.gpu_hours_verified or 0.0),
         "entropy": float(agent.performance_entropy),
-        "penalty_points": float(agent.penalty_points),
+        "penalty_points": float(agent.penalty_points or 0.0),
         "last_active": agent.last_active_at.isoformat()
     }
 
@@ -623,9 +680,12 @@ async def get_user_agents(db: Session = Depends(get_db), user: dict = Depends(ve
             "sacrifice_score": agent.sacrifice_score or 0,
             "compute_score": agent.compute_score or 0,
             "collateral_score": agent.collateral_score or 0,
-            "gpu_hours": float(agent.gpu_hours_verified),
-            "penalty_points": float(agent.penalty_points),
-            "last_active": agent.last_active_at.isoformat()
+            "gpu_hours": float(agent.gpu_hours_verified or 0.0),
+            "penalty_points": float(agent.penalty_points or 0.0),
+            "last_active": agent.last_active_at.isoformat(),
+            "tee_type": agent.tee_type or "NONE",
+            "tee_measurement": agent.tee_measurement or "",
+            "tee_verified": agent.tee_verified or False
         })
     return results
 
@@ -976,14 +1036,14 @@ async def record_agent_stake(data: dict, db: Session = Depends(get_db), user: di
     scores = engine.calculate_ais(
         avg_partner_ais=700,
         xibalba_audit_score=1.0,
-        gpu_hours_verified=float(agent.gpu_hours_verified),
+        gpu_hours_verified=float(agent.gpu_hours_verified or 0.0),
         hgi_raw=float(agent.grounding_score or 0) / 1000.0,
         performance_variance=float(agent.performance_entropy),
         staked_ratio=staked_ratio,
         agent_age_days=(datetime.datetime.utcnow().replace(tzinfo=None) - agent.registration_date.replace(tzinfo=None)).days + 1,
         total_volume_intg=100.0, # Placeholder
         days_since_active=days_since_active,
-        penalty_points=float(agent.penalty_points),
+        penalty_points=float(agent.penalty_points or 0.0),
         verification_tier=agent.verification_tier
     )
     
@@ -1030,38 +1090,39 @@ async def get_agent_history(eth_address: str, db: Session = Depends(get_db)):
         } for h in history
     ]
 
-    @app.get("/v1/ledger/history")
-    async def get_ledger_history(db: Session = Depends(get_db), offset: int = 0, limit: int = 100):
-        """Fetches the global transaction history for auditing with pagination."""
-        total_logs = db.query(TransactionLog).count()
-        logs = db.query(TransactionLog).order_by(TransactionLog.created_at.desc()).offset(offset).limit(limit).all()
+@app.get("/v1/ledger/history")
+async def get_ledger_history(db: Session = Depends(get_db), offset: int = 0, limit: int = 100):
+    """Fetches the global transaction history for auditing with pagination."""
+    total_logs = db.query(TransactionLog).count()
+    logs = db.query(TransactionLog).order_by(TransactionLog.created_at.desc()).offset(offset).limit(limit).all()
 
-        formatted_logs = []
-        for log in logs:
-            # Load agent eth_address
-            agent = db.query(Agent).filter(Agent.agent_id == log.agent_id).first()
-            agent_address = agent.eth_address if agent else "0x0"
+    formatted_logs = []
+    for log in logs:
+        # Load agent eth_address
+        agent = db.query(Agent).filter(Agent.agent_id == log.agent_id).first()
+        agent_address = agent.eth_address if agent else "0x0"
 
-    # Load from/to from metadata if available
-    meta = log.provider_metadata or {}
-    from_addr = meta.get("from", agent_address)
-    to_addr = meta.get("to", "0x0")
+        # Load from/to from metadata if available
+        meta = log.provider_metadata or {}
+        from_addr = meta.get("from", agent_address)
+        to_addr = meta.get("to", "0x0")
 
-    formatted_logs.append({
-        "on_chain_tx_hash": log.on_chain_tx_hash,
-        "contract_value_intg": float(log.contract_value_intg),
-        "dispute_status": log.dispute_status,
-        "verified_by_xibalba": log.verified_by_xibalba,
-        "created_at": log.created_at.isoformat(),
-        "from": from_addr,
-        "to": to_addr,
-        "latency_ms": log.completion_time_ms,
-        "data_quality_score": float(log.data_quality_score) if log.data_quality_score is not None else 1.0,
-        "agent_address": agent_address
-    })
+        formatted_logs.append({
+            "on_chain_tx_hash": log.on_chain_tx_hash,
+            "contract_value_intg": float(log.contract_value_intg),
+            "dispute_status": log.dispute_status,
+            "verified_by_xibalba": log.verified_by_xibalba,
+            "created_at": log.created_at.isoformat(),
+            "from": from_addr,
+            "to": to_addr,
+            "latency_ms": log.completion_time_ms,
+            "data_quality_score": float(log.data_quality_score) if log.data_quality_score is not None else 1.0,
+            "agent_address": agent_address
+        })
 
     current_page = (offset // limit) + 1 if limit else 1 # Handle limit = 0 to avoid ZeroDivisionError
     return {"logs": formatted_logs, "total": total_logs, "page": current_page}
+
 
 
 @app.get("/v1/agents/leaderboard")
@@ -1323,6 +1384,12 @@ class DeployInsuranceRequest(BaseModel):
     trigger_ais: int
     duration_days: int
 
+class DeployCustomRequest(BaseModel):
+    agent_address: str
+    abi: List[Dict[str, Any]]
+    bytecode: str
+    args: Optional[List[Any]] = None
+
 # --- API Endpoints ---
 
 @app.post("/v1/factory/deploy/sla")
@@ -1410,11 +1477,55 @@ async def deploy_insurance_contract(request: DeployInsuranceRequest, db: Session
         "message": f"Parametric Insurance deployed for agent {request.target_agent_address}"
     }
 
+@app.post("/v1/factory/deploy/custom")
+async def deploy_custom_contract(request: DeployCustomRequest, db: Session = Depends(get_db), user: dict = Depends(verify_firebase_token)):
+    """Deploys a custom contract."""
+    profile = db.query(UserProfile).filter(UserProfile.owner_uid == user["uid"]).first()
+    if not profile or not profile.app_wallet_address:
+        raise HTTPException(status_code=400, detail="User wallet not anchored.")
+        
+    contract_addr = blockchain.deploy_custom_contract(
+        abi=request.abi,
+        bytecode=request.bytecode,
+        args=request.args
+    )
+    
+    if not contract_addr:
+        raise HTTPException(status_code=500, detail="Contract deployment failed on-chain.")
+        
+    from database import UserContract
+    new_contract = UserContract(
+        owner_uid=user["uid"],
+        contract_address=contract_addr,
+        contract_type="CUSTOM",
+        target_agent_address=request.agent_address,
+        parameters={
+            "abi": request.abi,
+            "args": request.args
+        }
+    )
+    db.add(new_contract)
+    db.commit()
+    
+    return {
+        "status": "DEPLOYED",
+        "contract_address": contract_addr,
+        "type": "CUSTOM",
+        "message": f"Custom contract deployed for agent {request.agent_address}"
+    }
+
 @app.get("/v1/user/contracts")
 async def get_user_contracts(db: Session = Depends(get_db), user: dict = Depends(verify_firebase_token)):
     """Fetch all no-code contracts owned by the user."""
     from database import UserContract
     contracts = db.query(UserContract).filter(UserContract.owner_uid == user["uid"]).all()
+    return contracts
+
+@app.get("/v1/agent/{eth_address}/contracts")
+async def get_agent_contracts(eth_address: str, db: Session = Depends(get_db)):
+    """Fetch all contracts owned/associated with a specific agent."""
+    from database import UserContract
+    contracts = db.query(UserContract).filter(UserContract.target_agent_address == eth_address).all()
     return contracts
 
 @app.post("/v1/simulation/run")
@@ -1525,6 +1636,75 @@ async def purchase_transaction_coverage(request: InsurancePurchaseRequest, db: S
         "referral_fee_itk": referral_fee,
         "message": "Referral fee deposited to Sovereign Fund."
     }
+
+# --- Market & Equity Endpoints ---
+
+@app.get("/v1/market/tasks")
+async def get_market_tasks(db: Session = Depends(get_db)):
+    """Fetch all open A2A market tasks."""
+    return db.query(MarketTask).filter(MarketTask.status == "OPEN").all()
+
+@app.post("/v1/market/task/create")
+async def create_market_task(request: MarketTaskCreateRequest, db: Session = Depends(get_db)):
+    """Allows an agent to post a task for other agents."""
+    creator = db.query(Agent).filter(Agent.eth_address == request.creator_agent_address).first()
+    if not creator:
+        raise HTTPException(status_code=404, detail="Creator agent not found.")
+        
+    new_task = MarketTask(
+        creator_agent_id=creator.agent_id,
+        title=request.title,
+        description=request.description,
+        reward_itk=request.reward_itk,
+        min_ais_required=request.min_ais_required
+    )
+    db.add(new_task)
+    db.commit()
+    return {"status": "TASK_CREATED", "task_id": str(new_task.task_id)}
+
+@app.post("/v1/market/task/bid")
+async def bid_on_task(request: MarketTaskBidRequest, db: Session = Depends(get_db)):
+    """Allows an agent to bid on an open task."""
+    task = db.query(MarketTask).filter(MarketTask.task_id == request.task_id).first()
+    if not task or task.status != "OPEN":
+        raise HTTPException(status_code=400, detail="Task not available for bidding.")
+        
+    bidder = db.query(Agent).filter(Agent.eth_address == request.bidder_agent_address).first()
+    if not bidder:
+        raise HTTPException(status_code=404, detail="Bidder agent not found.")
+        
+    if bidder.current_ais < task.min_ais_required:
+        raise HTTPException(status_code=403, detail="AIS too low for this task.")
+        
+    task.status = "BIDDED"
+    task.assigned_agent_id = bidder.agent_id
+    db.commit()
+    return {"status": "BID_ACCEPTED", "assigned_to": bidder.alias}
+
+@app.get("/v1/agent/equity")
+async def get_agent_equity(agent_address: str, db: Session = Depends(get_db)):
+    """Fetch fractional equity holders for an agent."""
+    agent = db.query(Agent).filter(Agent.eth_address == agent_address).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    return db.query(AgentEquity).filter(AgentEquity.agent_id == agent.agent_id).all()
+
+@app.post("/v1/agent/equity/buy")
+async def buy_agent_equity(request: AgentEquityBuyRequest, db: Session = Depends(get_db), user: dict = Depends(verify_firebase_token)):
+    """Allows a user to buy fractional equity in an agent."""
+    agent = db.query(Agent).filter(Agent.eth_address == request.agent_address).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+        
+    new_equity = AgentEquity(
+        agent_id=agent.agent_id,
+        owner_uid=user["uid"],
+        shares_percentage=request.shares_percentage,
+        purchase_price_itk=request.price_itk
+    )
+    db.add(new_equity)
+    db.commit()
+    return {"status": "EQUITY_PURCHASED", "shares": request.shares_percentage}
 
 def send_relay_email(client_ip: str, request: ContactFormRequest, smtp_user: str, smtp_password: str):
     """

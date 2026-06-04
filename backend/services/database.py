@@ -87,6 +87,11 @@ class Agent(Base):
     xns_handle = Column(String(100), unique=True, nullable=True, index=True) # e.g. "xibalba.intg"
     agent_metadata = Column(JSON, nullable=True)
 
+    # Advanced upgrades: Hardware Enclave (TEE) measurements
+    tee_type = Column(String(50), default="NONE")
+    tee_measurement = Column(String(64), nullable=True)
+    tee_verified = Column(Boolean, default=False)
+
 class UserProfile(Base):
     __tablename__ = "user_profiles"
 
@@ -113,7 +118,7 @@ class GlobalSettings(Base):
 class TransactionLog(Base):
     __tablename__ = "transaction_logs"
 
-    transaction_id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    log_id = Column("transaction_id", GUID(), primary_key=True, default=uuid.uuid4)
     agent_id = Column(GUID(), ForeignKey("agents.agent_id"))
     on_chain_tx_hash = Column(String(66), unique=True, nullable=False, index=True)
     contract_value_intg = Column(Numeric(24, 18))
@@ -176,6 +181,18 @@ class UserContract(Base):
     status = Column(String(20), default="ACTIVE") # ACTIVE, COMPLETED, CLAIMED, REFUNDED
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
+class ContractClaim(Base):
+    __tablename__ = "contract_claims"
+
+    claim_id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    contract_id = Column(GUID(), ForeignKey("user_contracts.contract_id"))
+    log_id = Column(GUID(), ForeignKey("transaction_logs.log_id"), nullable=True) # For SLAs
+    claim_type = Column(String(50)) # SLA_BREACH, PARAMETRIC_TRIGGER
+    payout_amount_itk = Column(Numeric(24, 18))
+    on_chain_claim_tx = Column(String(66), nullable=True)
+    status = Column(String(20), default="PENDING") # PENDING, PAID, REJECTED
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
 class ContactInquiry(Base):
     __tablename__ = "contact_inquiries"
 
@@ -200,6 +217,29 @@ class GovernanceProposal(Base):
     new_value = Column(String(50), nullable=False)
     risk_level = Column(String(20), default="MEDIUM") # LOW, MEDIUM, HIGH
     status = Column(String(20), default="ACTIVE") # ACTIVE, PASSED, REJECTED
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+class MarketTask(Base):
+    __tablename__ = "market_tasks"
+
+    task_id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    creator_agent_id = Column(GUID(), ForeignKey("agents.agent_id"))
+    title = Column(String(255), nullable=False)
+    description = Column(String(1000), nullable=True)
+    reward_itk = Column(Numeric(24, 18), nullable=False)
+    min_ais_required = Column(Integer, default=0)
+    status = Column(String(20), default="OPEN") # OPEN, BIDDED, COMPLETED, CANCELLED
+    assigned_agent_id = Column(GUID(), ForeignKey("agents.agent_id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+class AgentEquity(Base):
+    __tablename__ = "agent_equity"
+
+    equity_id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    agent_id = Column(GUID(), ForeignKey("agents.agent_id"))
+    owner_uid = Column(String(128), nullable=False)
+    shares_percentage = Column(Numeric(5, 4), nullable=False) # 0.0 to 1.0
+    purchase_price_itk = Column(Numeric(24, 18), nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 def get_db():

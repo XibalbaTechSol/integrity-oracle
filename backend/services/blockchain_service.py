@@ -47,6 +47,51 @@ class IntegrityBlockchainService:
         else:
             self.factory_contract = None
 
+        self.slasher_address = os.getenv("SLASHER_ADDRESS")
+        self.slasher_abi = self._load_abi_file("Slasher.json")
+
+    def _load_abi_file(self, filename: str):
+        path = os.path.join(os.path.dirname(__file__), "abi", filename)
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                data = json.load(f)
+                return data['abi'] if isinstance(data, dict) and 'abi' in data else data
+        return []
+
+    def resolve_dispute_on_chain(self, deal_id_hex: str, justified: bool):
+        """
+        Oracle resolves a dispute on-chain via the Slasher contract.
+        """
+        if not self.slasher_address or not self.slasher_abi or not self.private_key:
+            print("[BLOCKCHAIN] Slasher or Private Key not configured.")
+            return None
+
+        slasher = self.w3.eth.contract(address=self.w3.to_checksum_address(self.slasher_address), abi=self.slasher_abi)
+        oracle_account = self.w3.eth.account.from_key(self.private_key)
+        
+        try:
+            # Convert deal_id string to bytes32 (padded)
+            if deal_id_hex.startswith("0x"):
+                deal_id_bytes = self.w3.to_bytes(hexstr=deal_id_hex)
+            else:
+                # If it's a string ID, hash it to get bytes32
+                deal_id_bytes = self.w3.keccak(text=deal_id_hex)
+            
+            tx = slasher.functions.resolveDispute(deal_id_bytes, justified).build_transaction({
+                'from': oracle_account.address,
+                'nonce': self.w3.eth.get_transaction_count(oracle_account.address),
+                'gas': 150000,
+                'gasPrice': self.w3.eth.gas_price
+            })
+            
+            signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.private_key)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            print(f"[BLOCKCHAIN] Dispute resolved on-chain: {tx_hash.hex()}")
+            return tx_hash.hex()
+        except Exception as e:
+            print(f"[BLOCKCHAIN] On-chain dispute resolution failed: {e}")
+            return None
+
     def anchor_state_root(self, state_root: bytes):
         """Anchors a new Merkle root of the Trust Vault on-chain."""
         if not self.anchor_contract or not self.private_key:
@@ -89,14 +134,18 @@ class IntegrityBlockchainService:
         factory_abi_path = os.path.join(os.path.dirname(__file__), "abi", "NoCodeFactory.json")
         
         if os.path.exists(registry_abi_path):
-            with open(registry_abi_path, 'r') as f: self.abi = json.load(f)
+            with open(registry_abi_path, 'r') as f:
+                data = json.load(f)
+                self.abi = data['abi'] if isinstance(data, dict) and 'abi' in data else data
             print(f"[BLOCKCHAIN] Loaded Registry ABI from {registry_abi_path}")
         else:
             self.abi = []
             print(f"[BLOCKCHAIN] Warning: Registry ABI not found")
         
         if os.path.exists(itk_abi_path):
-            with open(itk_abi_path, 'r') as f: self.itk_abi = json.load(f)
+            with open(itk_abi_path, 'r') as f:
+                data = json.load(f)
+                self.itk_abi = data['abi'] if isinstance(data, dict) and 'abi' in data else data
             print(f"[BLOCKCHAIN] Loaded ITK ABI from {itk_abi_path}")
         else:
             self.itk_abi = []
@@ -105,7 +154,7 @@ class IntegrityBlockchainService:
         if os.path.exists(factory_abi_path):
             with open(factory_abi_path, 'r') as f:
                 data = json.load(f)
-                self.factory_abi = data['abi'] if 'abi' in data else data
+                self.factory_abi = data['abi'] if isinstance(data, dict) and 'abi' in data else data
             print(f"[BLOCKCHAIN] Loaded Factory ABI from {factory_abi_path}")
         else:
             self.factory_abi = []
@@ -120,7 +169,7 @@ class IntegrityBlockchainService:
             return "0x_MOCKED_KMS_TX_HASH"
         else:
             signed_tx = self.w3.eth.account.sign_transaction(transaction, private_key=signer_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             return tx_hash.hex()
 
     def update_agent_reputation(self, agent_address: str, ais: int, tier: int):
@@ -212,7 +261,7 @@ class IntegrityBlockchainService:
             })
             
             signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=from_private_key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             return tx_hash.hex()
         except Exception as e:
             print(f"[SWEEP] Failed for {from_address}: {e}")
@@ -326,4 +375,27 @@ class IntegrityBlockchainService:
             return None
         except Exception as e:
             print(f"[FACTORY] Insurance deployment failed: {e}")
+            return None
+
+    def deploy_custom_contract(self, abi: list, bytecode: str, args: list = None):
+        """Deploys a custom contract using the Oracle's key for gas."""
+        if not self.private_key:
+            return None
+        try:
+            from_addr = Account.from_key(self.private_key).address
+            nonce = self.w3.eth.get_transaction_count(from_addr)
+            
+            contract = self.w3.eth.contract(abi=abi, bytecode=bytecode)
+            constructor_tx = contract.constructor(*(args or [])).build_transaction({
+                'from': from_addr,
+                'nonce': nonce,
+                'gas': 2000000,
+                'gasPrice': self.w3.eth.gas_price
+            })
+            
+            tx_hash = self.secure_sign_and_send(constructor_tx, self.private_key)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            return receipt['contractAddress']
+        except Exception as e:
+            print(f"[FACTORY] Custom deployment failed: {e}")
             return None

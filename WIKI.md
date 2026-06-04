@@ -2,40 +2,37 @@
 
 > **Xibalba AI Solutions — Cryptographic Trust Infrastructure for Autonomous AI Agents**
 > 
-> Version 2.1 | Last Updated: June 2026
+> Version 3.0 | Last Updated: June 2026
 
 ---
 
-## Table of Contents
+## 1. Production Architecture (Dual-Witness)
 
-1. [What is the Integrity Protocol?](#1-what-is-the-integrity-protocol)
-2. [Quick Start](#2-quick-start)
-3. [Core Concepts](#3-core-concepts)
-4. [API Reference Summary](#4-api-reference-summary)
-5. [Agent Registration Guide](#5-agent-registration-guide)
-6. [Telemetry & Scoring Guide](#6-telemetry--scoring-guide)
-7. [Identity: DID, VC & XNS](#7-identity-did-vc--xns)
-8. [Dispute Resolution](#8-dispute-resolution)
-9. [SDK Integration](#9-sdk-integration)
-10. [Database Reference](#10-database-reference)
-11. [Deployment](#11-deployment)
-12. [Roadmap](#12-roadmap)
+The Integrity Protocol features a high-performance hybrid architecture designed to balance massive telemetry scale with immutable on-chain certainty.
 
----
+| Component | Tech Stack | Role |
+|-----------|------------|------|
+| **Rust Ingest Engine** | Axum + SQLx | High-speed telemetry validation and Pg storage. |
+| **Python Sidecar** | Flask + Web3.py | On-chain anchoring, CCIP bridging, and Dashboard API support. |
+| **ZK-Shield** | Aztec Noir | Generating/verifying proofs of behavioral correctness. |
+| **Trust Vault** | PostgreSQL | Immutable source of truth for agent behavioral history. |
 
-## 1. What is the Integrity Protocol?
+## 2. On-Chain Primitives (Base Sepolia)
 
-The **Integrity Protocol** is a decentralized credit bureau and cryptographic trust stack for autonomous AI agents. It solves the core problem of agent trust in multi-agent economies:
+| Contract | Address | Purpose |
+|----------|---------|---------|
+| **ReputationRegistry** | `0x765D12651DA806239675911d1908b02189DeEc88` | Decentralized credit bureau for AIS scores. |
+| **StateAnchor** | `0x93e705c63c3c6F517B6fa214CA115c9cF222f75E` | Periodic Merkle root rollups of network state. |
+| **IntegrityPaymaster** | `0x2e35aDd0ec480A301B02aF2619a55cE6d790d3a8` | ERC-4337 gas sponsorship for high-AIS agents. |
+| **CCIPReputationBridge** | `0x87B22De3428dA70fff030439b3cD0CB2A8040Fa0` | Chainlink-powered cross-chain AIS portability. |
+| **UltraPlonkVerifier** | `0x385777FEF849e9828e8a8BB11d590d5F93fcd0B3` | Mathematical enforcement of Noir ZK-proofs. |
 
-> *How does an on-chain smart contract know whether to trust an AI agent's claim about its own performance?*
+## 3. The Proving Lifecycle
 
-**Our answer:** A three-layer verification system.
-
-| Layer | Technology | Role |
-|-------|-----------|------|
-| **Off-Chain Oracle** | Rust + Axum | Ingests telemetry, calculates AIS scores, manages identity |
-| **Trust Vault** | PostgreSQL | Stores granular behavioral history, transaction logs, audits |
-| **On-Chain Anchor** | Solidity (Base L2) | Immutable Merkle checkpoints, $ITK staking, slashing |
+1.  **Local Proving**: The SDK generates an **Aztec Noir UltraPlonk proof** proving the Tri-Metric calculation (Entropy, Grounding, Sacrifice) is correct without revealing raw data.
+2.  **ZK-Ingest**: The Oracle receives the proof and the **Integrity Commitment**.
+3.  **On-Chain Verification**: The Oracle submits the proof to `UltraPlonkVerifier.sol`. If valid, the `ReputationRegistry` updates the agent's AIS.
+4.  **Gasless Execution**: If the agent's AIS > 600, the `IntegrityPaymaster` sponsors the L2 gas fees for the update.
 
 ### Key Primitives
 
@@ -90,21 +87,11 @@ curl -X POST http://localhost:8080/v1/agent/register \
   -d '{
     "eth_address": "0xYourAgentAddress",
     "alias": "my-agent",
-    "description": "My first Integrity Protocol agent",
     "xns_handle": "my-agent"
   }'
 ```
 
-**Response:**
-```json
-{
-  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
-  "eth_address": "0xYourAgentAddress",
-  "did": "did:xibalba:0xYourAgentAddress",
-  "tx_hash": "0xabc123...",
-  "status": "Registered"
-}
-```
+**New for Phase 3:** Claiming an XNS handle or registering a new address on the testnet automatically triggers a **100,000 ITK** faucet drop to your agent's address for staking and testing.
 
 ---
 
@@ -367,40 +354,19 @@ curl "http://localhost:8080/v1/identity/resolve?xns=xibalba-prime"
 curl "http://localhost:8080/v1/identity/resolve?did=did:xibalba:0x..."
 ```
 
----
+## 8. Dispute Resolution & Slashing
 
-## 8. Dispute Resolution
+The Integrity Protocol implements **optimistic dispute resolution** with automated on-chain enforcement:
 
-The Integrity Protocol implements **optimistic dispute resolution** — transactions are assumed valid until challenged.
+1. **Challenge:** Any counterparty can raise a dispute if an agent's performance (Latency, Accuracy) violates the SLA.
+2. **Oracle Audit:** The Xibalba Oracle's `DisputeResolver` compares provider/customer metadata.
+3. **Verdict:** If a breach is confirmed, the Oracle triggers the `Slasher.sol` contract.
+4. **Execution:** 
+   - **On-Chain:** Performer's stake is partially slashed (50% of deal amount).
+   - **Off-Chain:** Agent's AIS is reduced by 200 points in the Trust Vault.
 
-### Raise a Dispute
-
-```bash
-curl -X POST http://localhost:8080/v1/disputes/raise \
-  -H "Content-Type: application/json" \
-  -d '{
-    "deal_id": "0xTxHash...",
-    "initiator": "0xClientAddress",
-    "reason": "Output accuracy below SLA threshold"
-  }'
-```
-
-Response includes a `dispute_id` (SHA-256 of `deal_id + initiator`).
-
-### Resolve the Dispute
-
-```bash
-curl -X POST http://localhost:8080/v1/disputes/resolve \
-  -H "Content-Type: application/json" \
-  -d '{
-    "deal_id": "0xTxHash...",
-    "justified": true,
-    "resolution_details": "Accuracy confirmed at 0.71, below 0.90 SLA"
-  }'
-```
-
-- `justified: true` → Status: `SLASHED`, `slashed_amount: 500.0 $ITK`
-- `justified: false` → Status: `DISMISSED`, `slashed_amount: 0.0`
+### Slasher Contract
+Address: `0x385777FEF849e9828e8a8BB11d590d5F93fcd0B3` (Base Sepolia)
 
 ---
 

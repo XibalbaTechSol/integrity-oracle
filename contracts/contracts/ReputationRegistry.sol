@@ -33,7 +33,8 @@ contract ReputationRegistry is AccessControl, IValidationRegistry, ReentrancyGua
     struct AgentProfile {
         uint256 ais;          // 300 - 1000
         uint256 jobCount;     // Number of successful transactions
-        uint256 totalStaked;  // Amount of ITK currently staked
+        uint256 totalStaked;  // Amount of ITK staked BY the agent
+        uint256 externalStaked; // Amount of ITK staked TO the agent by LPs
         uint256 lastUpdate;   // Timestamp of last activity
         bool isVerified;      // Xibalba Solutions audit status
         uint256 verificationTier; // Tier 1-3
@@ -50,6 +51,8 @@ contract ReputationRegistry is AccessControl, IValidationRegistry, ReentrancyGua
     
     mapping(address => AgentProfile) public agents;
     mapping(bytes32 => bool) public pendingValidations;
+    mapping(address => mapping(address => uint256)) public userStakes; // user => agent => amount
+
     
     event AISUpdated(address indexed agent, uint256 oldScore, uint256 newScore);
     event Staked(address indexed agent, uint256 amount);
@@ -100,44 +103,64 @@ contract ReputationRegistry is AccessControl, IValidationRegistry, ReentrancyGua
         pendingValidations[_requestHash] = false;
         emit ValidationResponded(_requestHash, _status, _uri);
     }
+}
+
+/**
+ * @title IUltraVerifier
+ * @dev Interface for the Aztec Noir generated UltraPlonk verifier.
+ */
+interface IUltraVerifier {
+    function verify(bytes calldata _proof, bytes32[] calldata _publicInputs) external view returns (bool);
+}
 
     /**
-     * @notice Verifies a Noir ZK-proof of reputation and updates the local AIS cache.
-     * @param _proof The Noir ZK-proof bytes.
-     * @param _publicInputs Array of public inputs: [ais_threshold, max_risk_days, agent_address, state_root]
-     */
-    function verifyReputationZK(bytes calldata _proof, bytes32[] calldata _publicInputs) external nonReentrant {
-        address agent = address(uint160(uint256(_publicInputs[2])));
-        require(msg.sender == agent, "Only the agent can submit their own ZK-proof.");
-        
-        require(zkVereifier != address(0), "ZK Verifier not configured.");
-        require(stateAnchor != address(0), "State Anchor not configured.");
-        
-        bytes32 stateRoot = _publicInputs[3];
+     * @title ReputationRegistry
+    ...
+        /**
+         * @notice Verifies a Noir ZK-proof of reputation and updates the local AIS cache.
+         * @param _proof The Noir ZK-proof bytes.
+         * @param _publicInputs Array of public inputs: [ais_threshold, max_risk_days, agent_address, state_root]
+         */
+        function verifyReputationZK(bytes calldata _proof, bytes32[] calldata _publicInputs) external nonReentrant {
+            address agent = address(uint160(uint256(_publicInputs[2])));
+            require(msg.sender == agent, "Only the agent can submit their own ZK-proof.");
 
-        uint256 threshold = uint256(_publicInputs[0]);
-        
-        // Update job count or last activity if proof is valid
-        agents[agent].lastUpdate = block.timestamp;
-        
-        emit ZKProofVerified(agent, stateRoot);
-    }
+            require(zkVereifier != address(0), "ZK Verifier not configured.");
+            require(stateAnchor != address(0), "State Anchor not configured.");
 
-    /**
-     * @notice Registers or updates an agent's AIS based on protocol calculations.
-     */
-    function updateAIS(address _agent, uint256 _ais, uint256 _tier) external onlyRole(VALIDATOR_ROLE) {
-        require(_ais >= 300 && _ais <= 1000, "AIS out of valid range.");
-        require(_tier >= 1 && _tier <= 3, "Invalid tier.");
-        
-        uint256 oldScore = agents[_agent].ais;
-        agents[_agent].ais = _ais;
-        agents[_agent].verificationTier = _tier;
-        agents[_agent].lastUpdate = block.timestamp;
-        
-        emit AISUpdated(_agent, oldScore, _ais);
-        emit VerificationStatusChanged(_agent, agents[_agent].isVerified, _tier);
-    }
+            // 1. CALL THE ZK-VERIFIER
+            bool isValid = IUltraVerifier(zkVereifier).verify(_proof, _publicInputs);
+            require(isValid, "Invalid ZK Proof: Mathematical constraint failure.");
+
+            bytes32 public constant VALIDATOR_ROLE = keccak256("VALIDATOR_ROLE");
+            bytes32 public constant BRIDGE_ROLE = keccak256("BRIDGE_ROLE");
+            ...
+            /**
+             * @notice Registers or updates an agent's AIS based on protocol calculations.
+             */
+            function updateAIS(address _agent, uint256 _ais, uint256 _tier) external onlyRole(VALIDATOR_ROLE) {
+                _updateAISInternal(_agent, _ais, _tier);
+            }
+
+            /**
+             * @notice Updates reputation score received from a trusted cross-chain bridge.
+             */
+            function updateAISByBridge(address _agent, uint256 _ais, uint256 _tier) external onlyRole(BRIDGE_ROLE) {
+                _updateAISInternal(_agent, _ais, _tier);
+            }
+
+            function _updateAISInternal(address _agent, uint256 _ais, uint256 _tier) internal {
+                require(_ais >= 300 && _ais <= 1000, "AIS out of valid range.");
+                require(_tier >= 1 && _tier <= 3, "Invalid tier.");
+
+                uint256 oldScore = agents[_agent].ais;
+                agents[_agent].ais = _ais;
+                agents[_agent].verificationTier = _tier;
+                agents[_agent].lastUpdate = block.timestamp;
+
+                emit AISUpdated(_agent, oldScore, _ais);
+            }
+
     
     /**
      * @notice Broadcasts an agent's AIS score to a destination chain (e.g. Ethereum L1) via Chainlink CCIP.
@@ -192,9 +215,39 @@ contract ReputationRegistry is AccessControl, IValidationRegistry, ReentrancyGua
     }
 
     /**
+     * @notice Stakes ITK tokens to a specific agent to boost their reputation.
+     */
+    function stakeToAgent(address _agent, uint256 _amount) external nonReentrant {
+        require(_amount > 0, "Amount must be greater than zero.");
+        require(intgToken.transferFrom(msg.sender, address(this), _amount), "Stake transfer failed.");
+        
+        userStakes[msg.sender][_agent] += _amount;
+        agents[_agent].externalStaked += _amount;
+        agents[_agent].lastUpdate = block.timestamp;
+        
+        emit Staked(_agent, _amount);
+    }
+
+    /**
+     * @notice Unstakes ITK tokens from a specific agent.
+     */
+    function unstakeFromAgent(address _agent, uint256 _amount) external nonReentrant {
+        require(_amount > 0, "Amount must be greater than zero.");
+        require(userStakes[msg.sender][_agent] >= _amount, "Insufficient staked balance.");
+        
+        userStakes[msg.sender][_agent] -= _amount;
+        agents[_agent].externalStaked -= _amount;
+        
+        require(intgToken.transfer(msg.sender, _amount), "Unstake transfer failed.");
+        
+        emit Unstaked(_agent, _amount);
+    }
+
+    /**
      * @notice Unstakes ITK tokens, reducing the AIS boost.
      */
     function unstake(uint256 _amount) external nonReentrant {
+
         require(_amount > 0, "Amount must be greater than zero.");
         require(agents[msg.sender].totalStaked >= _amount, "Insufficient staked balance.");
         

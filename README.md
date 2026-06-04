@@ -140,15 +140,18 @@ These Solidity contracts are the on-chain backbone of the Integrity Protocol, an
 
 ### ⚖️ StateAnchor.sol
 - **Role:** The primary on-chain trust anchor. It periodically receives Merkle roots of off-chain agent AIS scores and other critical protocol states from the Oracle.
-- **Key Functionality:** Stores cryptographic commitments to the integrity of the entire agent network, allowing for light-client verification without re-computing all off-chain scores.
+- **Key Functionality:** Stores cryptographic commitments to the integrity of the entire agent network.
 
 ### 🌐 ReputationRegistry.sol
-- **Role:** Manages the on-chain mapping of agent Ethereum addresses to their current verification tier and associated metadata hashes.
-- **Key Functionality:** Allows for transparent lookup of an agent's on-chain tier status and links to their off-chain DID documents, facilitating trust evaluation for other smart contracts and external protocols.
+- **Role:** Manages the on-chain mapping of agent Ethereum addresses to their current AIS score, verification tier, and associated metadata.
+- **Key Functionality:** Authorizes validators (Oracles) to anchor scores and manages agent verification status.
 
-### 🛡️ IntegrityProtocol.sol (ERC-8004 Compliant)
-- **Role:** The main protocol entry point for on-chain interactions, including agent registration, staking events, and dispute finalization. Designed to be compatible with ERC-8004 (Account Abstraction).
-- **Key Functionality:** Orchestrates interactions between the other core contracts, enforcing protocol rules and updating agent states based on verified off-chain events.
+### ⚔️ Slasher.sol
+- **Role:** The automated enforcement arm for performance-based penalties.
+- **Key Functionality:** Receives dispute resolution calls from the Oracle and executes on-chain stake slashing.
+
+### 🛡️ IntegrityProtocol.sol
+- **Role:** Orchestrates agent-to-agent transactions and facilitates the "Completion Handshake" for metrics anchoring.
 
 ---
 

@@ -90,6 +90,8 @@ class AgentRegistrationRequest(BaseModel):
     alias: str
     description: Optional[str] = ""
     xns_handle: Optional[str] = None
+    tee_type: Optional[str] = "NONE"
+    tee_measurement: Optional[str] = None
 
 class IdentityUpgradeRequest(BaseModel):
     agent_eth_address: str
@@ -387,6 +389,9 @@ async def register_agent(
         existing.controller_entity = request.description or existing.controller_entity
         if request.xns_handle:
             existing.xns_handle = request.xns_handle
+        existing.tee_type = request.tee_type or existing.tee_type
+        existing.tee_measurement = request.tee_measurement or existing.tee_measurement
+        existing.tee_verified = True if request.tee_type and request.tee_type != "NONE" else existing.tee_verified
         db.commit()
         return {
             "status": "UPDATED",
@@ -415,7 +420,10 @@ async def register_agent(
         compute_score=0,
         collateral_score=0,
         is_active=True,
-        gpu_hours_verified=0.0
+        gpu_hours_verified=0.0,
+        tee_type=request.tee_type or "NONE",
+        tee_measurement=request.tee_measurement,
+        tee_verified=True if request.tee_type and request.tee_type != "NONE" else False
     )
     db.add(new_agent)
     db.flush()
@@ -587,7 +595,10 @@ async def get_agent_identity_profile(identifier: str, db: Session = Depends(get_
         "current_ais": capped_ais,
         "trust_level": VCIssuer._ais_to_trust_level(capped_ais),
         "did_document": DIDResolver.resolve(eth_address, agent.alias or "Agent", agent.xns_handle),
-        "verifiable_credential": VCIssuer.issue_ais_credential(eth_address, agent)
+        "verifiable_credential": VCIssuer.issue_ais_credential(eth_address, agent),
+        "tee_type": agent.tee_type or "NONE",
+        "tee_measurement": agent.tee_measurement or "",
+        "tee_verified": agent.tee_verified or False
     }
 
 

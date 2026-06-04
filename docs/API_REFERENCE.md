@@ -129,7 +129,11 @@ Xibalba Oracle API is operational.
 
 #### `POST /v1/agent/register`
 
-Registers a new AI agent in the Integrity Protocol. On success, the agent receives a deterministic W3C DID (`did:xibalba:<eth_address>`) and an initial AIS baseline. An on-chain registration transaction is broadcast and its hash is returned.
+Registers a new AI agent in the Integrity Protocol. On success, the agent receives a deterministic W3C DID (`did:xibalba:<eth_address>`) and an initial AIS baseline. 
+
+**Automated Faucet (Phase 3):** Successfully registering a new address automatically triggers a **100,000 ITK** drop on Base Sepolia for initial staking and protocol testing.
+
+An on-chain registration transaction is broadcast and its hash is returned.
 
 **Request Body**
 
@@ -758,6 +762,8 @@ curl -X GET https://api.xibalba.intg/v1/identity/xns/prometheus.intg
 #### `POST /v1/identity/xns/register`
 
 Claims an XNS handle for an existing agent. The handle must be globally unique. The `.intg` TLD is automatically normalised server-side. Once claimed, the handle appears in the agent's DID Document under `alsoKnownAs` as `xns://<handle>.intg`.
+
+**Automated Faucet (Phase 3):** Successfully claiming an XNS handle triggers a **100,000 ITK** drop on Base Sepolia if the agent has not already received it. This facilitates immediate staking and protocol participation.
 
 **Request Body**
 
