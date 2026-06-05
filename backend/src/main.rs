@@ -1,6 +1,6 @@
 use axum::{
     routing::{get, post, patch},
-    Router, Json, extract::{State, Path},
+    Router, Json, extract::{State, Path, Query},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -318,7 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // --- Helper: Cryptographic Provenance Signature Verification ---
-fn verify_agent_signature(address: &str, message_text: &str, signature: &str) -> bool {
+fn verify_agent_signature(address: &str, _message_text: &str, signature: &str) -> bool {
     if signature.starts_with("lit_pkp_sig_") {
         // Authenticate Lit Protocol PKP signature bound securely to agent address
         return signature.contains(address) || address.is_empty();
@@ -679,7 +679,7 @@ async fn bid_on_task(
 /// GET /v1/agent/equity — Lists holders for an agent
 async fn get_agent_equity(
     State(state): State<Arc<AppState>>,
-    extract::Query(params): extract::Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Vec<AgentEquityResponse>>, (axum::http::StatusCode, String)> {
     let addr = params.get("agent_address").ok_or((axum::http::StatusCode::BAD_REQUEST, "Missing agent_address".to_string()))?;
     
@@ -1034,7 +1034,7 @@ async fn ingest_telemetry(
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Autonomically update agent metadata if alias is provided in payload
-    if let Some(alias_val) = payload.metadata.as_object().and_then(|m| m.get("alias")).and_then(|v| v.as_str()) {
+    if let Some(alias_val) = payload.metadata.as_ref().and_then(|m| m.as_object()).and_then(|m| m.get("alias")).and_then(|v| v.as_str()) {
          let _ = sqlx::query(
             "UPDATE agents SET metadata = jsonb_set(metadata, '{alias}', $1) WHERE agent_id::text = $2"
         )
