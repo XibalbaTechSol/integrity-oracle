@@ -41,7 +41,7 @@ The Integrity Protocol features a high-performance hybrid architecture designed 
 | **AIS Score** | Agent Integrity Score (0–1000 bps). Dynamic credit rating, like FICO for AI agents |
 | **Tri-Metric Engine** | Three behavioral sub-scores: Entropy, Grounding, Sacrifice |
 | **BCC** | Behavioral Commitment Chain — agents commit to intended actions before execution |
-| **MCIP** | Model Contextual Integrity Protocol — GenUI input/output attestation |
+| **MCIP** | Model Contextual Integrity Protocol — Agent input/output validation |
 | **DID** | W3C Decentralized Identifier (`did:xibalba:<address>`) |
 | **VC** | W3C Verifiable Credential encoding AIS + trust level |
 | **XNS** | Xibalba Name Service — human-readable `.intg` handles for agents |
