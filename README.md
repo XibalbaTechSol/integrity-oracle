@@ -12,6 +12,7 @@
 |----------|------|
 | 📖 Wiki | [WIKI.md](./WIKI.md) |
 | 🗺️ Architecture | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) |
+| 🗺️ Lifecycle Mind Map | [docs/MINDMAP.md](./docs/MINDMAP.md) |
 | 📡 API Reference | [docs/API_REFERENCE.md](./docs/API_REFERENCE.md) |
 | 🏗️ Business Strategy | [docs/BUSINESS_STRATEGY.md](./docs/BUSINESS_STRATEGY.md) |
 | 📋 Roadmap | [docs/ROADMAP_AND_GOVERNANCE.md](./docs/ROADMAP_AND_GOVERNANCE.md) |
