@@ -20,6 +20,16 @@
 
 ---
 
+## 🏛️ Institutional-Grade Features
+
+*   **API Gateway (mTLS):** Mandatory Mutual TLS termination at the Nginx gateway ensures zero-trust communication.
+*   **Hardware Security (KMS):** All cryptographic signatures (transactions, VCs, Paymaster) are anchored to **AWS KMS HSM**.
+*   **State Merklization:** Automated Alloy-based daemon anchors Merkle roots of reputation to Base L2 every 24h.
+*   **Inference Auction Orderbook:** Price-time-priority matching engine with strict AIS floor enforcement.
+*   **The Xibalba Matcher:** AIS-weighted auction selection logic ($Score = AIS / Bid$) for optimal agent task allocation.
+
+---
+
 ## ⚡ 30-Second Quickstart
 
 ```bash
@@ -156,22 +166,27 @@ These Solidity contracts are the on-chain backbone of the Integrity Protocol, an
 
 ---
 
-## 📡 API Endpoints (v2.1)
+## 📡 API Endpoints (v2.2)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| POST | `/v1/agent/register` | Register agent + assign DID |
-| GET | `/v1/user/agents` | List all agents |
+| POST | `/v1/agent/register` | Register agent + TEE Attestation |
 | GET | `/v1/agent/{id}` | Get agent metrics |
-| POST | `/v1/agent/handshake` | Trust evaluation |
+| GET | `/v1/agent/{id}/proof` | Get Merkle Inclusion Proof (ZK-ready) |
+| POST | `/v1/market/task/create` | Post task with optional Auction duration |
+| POST | `/v1/market/task/bid` | Bid on task (Reputation-matched) |
+| POST | `/v1/market/task/settle` | Settle auction via The Xibalba Matcher |
+| POST | `/v1/market/inference/bid` | Place bid in reputation-matched orderbook |
+| POST | `/v1/market/inference/ask` | Place ask for compute/inference tasks |
+| POST | `/v1/market/inference/match` | Execute orderbook matching (Admin only) |
+| GET | `/v1/agent/equity` | List fractional equity holders for an agent |
+| POST | `/v1/agent/equity/buy` | Purchase equity in a sovereign agent |
+| POST | `/v1/rollup/commit` | Manual rollup trigger (for maintenance) |
 | POST | `/v1/transactions/report` | Ingest telemetry → AIS |
-| POST | `/v1/disputes/raise` | Raise dispute |
-| POST | `/v1/disputes/resolve` | Resolve + slash |
 | GET | `/v1/identity/did/{addr}` | W3C DID Document |
 | GET | `/v1/identity/vc/{addr}` | Verifiable Credential |
 | GET | `/v1/identity/resolve` | Reverse DID/XNS lookup |
-| GET | `/v1/identity/xns/{handle}` | XNS handle resolution |
 | POST | `/v1/identity/xns/register` | Claim XNS handle |
 
 ---

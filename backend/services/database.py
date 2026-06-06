@@ -86,6 +86,7 @@ class Agent(Base):
     owner_uid = Column(String(128), nullable=True, index=True) # Firebase UID
     xns_handle = Column(String(100), unique=True, nullable=True, index=True) # e.g. "xibalba.intg"
     agent_metadata = Column(JSON, nullable=True)
+    last_slash_date = Column(DateTime(timezone=True), nullable=True) # For ZK-ML last_slash_days
 
     # Advanced upgrades: Hardware Enclave (TEE) measurements
     tee_type = Column(String(50), default="NONE")
@@ -228,8 +229,20 @@ class MarketTask(Base):
     description = Column(String(1000), nullable=True)
     reward_itk = Column(Numeric(24, 18), nullable=False)
     min_ais_required = Column(Integer, default=0)
-    status = Column(String(20), default="OPEN") # OPEN, BIDDED, COMPLETED, CANCELLED
+    status = Column(String(20), default="OPEN") # OPEN, AUCTION, BIDDED, COMPLETED, CANCELLED
     assigned_agent_id = Column(GUID(), ForeignKey("agents.agent_id"), nullable=True)
+    auction_end_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+class MarketBid(Base):
+    __tablename__ = "market_bids"
+
+    bid_id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    task_id = Column(GUID(), ForeignKey("market_tasks.task_id"))
+    bidder_agent_id = Column(GUID(), ForeignKey("agents.agent_id"))
+    bid_amount_itk = Column(Numeric(24, 18), nullable=False) # Optional: if they want to undercut reward
+    bidder_ais_at_time = Column(Integer, nullable=False)
+    status = Column(String(20), default="PENDING") # PENDING, ACCEPTED, REJECTED
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 class AgentEquity(Base):
@@ -241,6 +254,17 @@ class AgentEquity(Base):
     shares_percentage = Column(Numeric(5, 4), nullable=False) # 0.0 to 1.0
     purchase_price_itk = Column(Numeric(24, 18), nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+class RevokedDID(Base):
+    __tablename__ = "revoked_dids"
+
+    revocation_id = Column(GUID(), primary_key=True, default=uuid.uuid4)
+    did = Column(String(255), unique=True, nullable=False, index=True)
+    agent_address = Column(String(42), nullable=False, index=True)
+    reason = Column(String(500), nullable=True)
+    evidence_hash = Column(String(66), nullable=True) # Pointer to forensic evidence
+    revoked_by_uid = Column(String(128), nullable=False)
+    revoked_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 def get_db():
     db = SessionLocal()

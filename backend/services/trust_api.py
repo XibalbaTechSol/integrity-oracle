@@ -434,7 +434,7 @@ class InsuranceQuoteResponse(BaseModel):
 
 class HandshakeRequest(BaseModel):
     target_eth_address: str
-    requester_eth_address: str
+    initiator_eth_address: str
 
 class HandshakeResponse(BaseModel):
     target_eth_address: str
@@ -574,11 +574,20 @@ async def perform_trust_handshake(request: HandshakeRequest, db: Session = Depen
     Provides a cryptographic proof of reputation at a specific timestamp.
     """
     agent = db.query(Agent).filter(Agent.eth_address == request.target_eth_address).first()
-    if not agent:
-        raise HTTPException(status_code=404, detail="Target agent not found.")
+    if not agent or not agent.is_active:
+        return {
+            "target_eth_address": request.target_eth_address,
+            "verified_ais": 0,
+            "verified_entropy": 0,
+            "verified_grounding": 0,
+            "trust_decision": "REVOKED",
+            "handshake_hash": "REVOKED",
+            "timestamp": datetime.datetime.utcnow().timestamp()
+        }
         
     ais = agent.current_ais
-    decision = "TRUSTED" if ais >= 700 else "CAUTION" if ais >= 400 else "REJECTED"
+    # Decision mapping: APPROVED for AIS >= 700, CAUTION for 400-699, DENIED below 400
+    decision = "APPROVED" if ais >= 700 else "CAUTION" if ais >= 400 else "DENIED"
     
     return {
         "target_eth_address": request.target_eth_address,
@@ -616,6 +625,7 @@ async def get_agent_score(identifier: str, db: Session = Depends(get_db)):
     return {
         "eth_address": agent.eth_address,
         "alias": agent.alias,
+        "is_active": agent.is_active,
         "verification_tier": agent.verification_tier,
         "current_ais": capped_ais,
         "grounding_score": agent.grounding_score or 0,
@@ -635,6 +645,24 @@ async def get_agent_score(identifier: str, db: Session = Depends(get_db)):
         "penalty_points": float(agent.penalty_points or 0.0),
         "last_active": agent.last_active_at.isoformat()
     }
+
+@app.get("/v1/agent/{identifier}/proof")
+async def get_agent_merkle_proof(identifier: str, db: Session = Depends(get_db)):
+    """
+    Returns the Merkle path and index for an agent's reputation state.
+    Used by ZK-Provers (Noir) to generate membership proofs.
+    """
+    # Resolve identifier to eth_address
+    eth_address = identifier
+    if identifier.startswith("did:intg:"):
+        eth_address = identifier.replace("did:intg:", "")
+        
+    from merkle_service import MerkleService
+    proof = MerkleService.get_merkle_proof(db, eth_address)
+    if "error" in proof:
+        raise HTTPException(status_code=404, detail=proof["error"])
+        
+    return proof
 
 @app.get("/v1/identity/agent/{identifier}")
 async def get_agent_identity_profile_via_trust(identifier: str, db: Session = Depends(get_db)):
@@ -943,6 +971,28 @@ async def update_global_settings(data: dict, db: Session = Depends(get_db), user
     db.commit()
     return {"status": "SETTINGS_UPDATED", "settings": settings}
 
+
+@app.post("/v1/protocol/anchor")
+async def anchor_protocol_state(db: Session = Depends(get_db), user: dict = Depends(verify_firebase_token)):
+    """
+    Computes the Merkle Root of all active agent states and anchors it on-chain.
+    Provides global finality for the Integrity Protocol's reputation vault.
+    """
+    from merkle_service import MerkleService
+    
+    # 1. Compute Merkle Root
+    root = MerkleService.calculate_reputation_root(db)
+    
+    # 2. Anchor on-chain
+    tx_hash = blockchain.anchor_state_root(bytes.fromhex(root))
+    
+    return {
+        "status": "ANCHORED",
+        "merkle_root": f"0x{root}",
+        "tx_hash": tx_hash,
+        "timestamp": datetime.datetime.utcnow().timestamp()
+    }
+
 @app.post("/v1/loan/request")
 async def request_loan(data: dict, db: Session = Depends(get_db), user: dict = Depends(verify_firebase_token)):
     """Request a short-term ITK loan based on agent AIS score."""
@@ -994,7 +1044,9 @@ async def register_agent_legacy(request: dict, db: Session = Depends(get_db), us
         eth_address=request["eth_address"],
         alias=request["alias"],
         description=request.get("description", ""),
-        xns_handle=request.get("xns_handle")
+        xns_handle=request.get("xns_handle"),
+        tee_type=request.get("tee_type", "NONE"),
+        tee_measurement=request.get("tee_measurement")
     )
     return await identity_register(reg_request, db, user)
 

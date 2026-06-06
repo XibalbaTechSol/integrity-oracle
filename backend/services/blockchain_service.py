@@ -3,6 +3,7 @@ import json
 from web3 import Web3
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
+from .kms_service import KmsService
 
 # Xibalba Solutions: Production-Grade Blockchain & Signing Service (v2.0)
 # This service supports both Local and Secure KMS (HSM) signing strategies.
@@ -14,6 +15,7 @@ class IntegrityBlockchainService:
         
         # PRODUCTION: Key ID for AWS KMS or HashiCorp Vault
         self.oracle_kms_id = os.getenv("XIBALBA_ORACLE_KMS_ID") 
+        self.kms_service = KmsService(self.oracle_kms_id) if self.oracle_kms_id else None
         # DEV/PILOT: Local Private Key
         self.private_key = os.getenv("XIBALBA_ORACLE_PRIVATE_KEY")
         
@@ -49,6 +51,25 @@ class IntegrityBlockchainService:
 
         self.slasher_address = os.getenv("SLASHER_ADDRESS")
         self.slasher_abi = self._load_abi_file("Slasher.json")
+
+        self.xns_address = os.getenv("XNS_CONTRACT_ADDRESS")
+        if self.xns_address:
+            xns_abi = [
+                {"inputs":[{"internalType":"string","name":"_handle","type":"string"},{"internalType":"address","name":"_agent","type":"address"}],"name":"register","outputs":[],"stateMutability":"nonpayable","type":"function"},
+                {"inputs":[{"internalType":"string","name":"_handle","type":"string"}],"name":"resolve","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}
+            ]
+            self.xns_contract = self.w3.eth.contract(address=self.w3.to_checksum_address(self.xns_address), abi=xns_abi)
+        else:
+            self.xns_contract = None
+
+        self.ccip_bridge_address = os.getenv("CCIP_BRIDGE_ADDRESS")
+        if self.ccip_bridge_address:
+            bridge_abi = [
+                {"inputs":[{"internalType":"uint64","name":"_destinationChainSelector","type":"uint64"},{"internalType":"address","name":"_agent","type":"address"},{"internalType":"address","name":"_feeToken","type":"address"}],"name":"bridgeReputation","outputs":[{"internalType":"bytes32","name":"messageId","type":"bytes32"}],"stateMutability":"payable","type":"function"}
+            ]
+            self.bridge_contract = self.w3.eth.contract(address=self.w3.to_checksum_address(self.ccip_bridge_address), abi=bridge_abi)
+        else:
+            self.bridge_contract = None
 
     def _load_abi_file(self, filename: str):
         path = os.path.join(os.path.dirname(__file__), "abi", filename)
@@ -92,40 +113,133 @@ class IntegrityBlockchainService:
             print(f"[BLOCKCHAIN] On-chain dispute resolution failed: {e}")
             return None
 
-    def anchor_state_root(self, state_root: bytes):
+    def get_oracle_address(self) -> str:
+        """Determines the active Oracle address from KMS or local key."""
+        if self.kms_service:
+            return self.kms_service.get_address()
+        if self.private_key:
+            return Account.from_key(self.private_key).address
+        return None
+
+    def anchor_state_root(self, state_root_hex: str):
         """Anchors a new Merkle root of the Trust Vault on-chain."""
-        if not self.anchor_contract or not self.private_key:
+        if not self.anchor_contract:
+            print("[BLOCKCHAIN] State Anchor contract not configured.")
             return None
+
+        from_addr = self.get_oracle_address()
+        if not from_addr:
+            return None
+
+        # Convert to bytes32
+        if isinstance(state_root_hex, str):
+            hex_val = state_root_hex if state_root_hex.startswith("0x") else "0x" + state_root_hex
+            root_bytes = self.w3.to_bytes(hexstr=hex_val)
+        else:
+            root_bytes = state_root_hex
         
-        from_addr = Account.from_key(self.private_key).address
-        nonce = self.w3.eth.get_transaction_count(from_addr)
-        
-        tx = self.anchor_contract.functions.anchorRoot(state_root).build_transaction({
-            'from': from_addr,
-            'nonce': nonce,
-            'gas': 100000,
-            'gasPrice': self.w3.eth.gas_price
-        })
-        
-        return self.secure_sign_and_send(tx, self.private_key)
+        try:
+            nonce = self.w3.eth.get_transaction_count(from_addr)
+            tx = self.anchor_contract.functions.anchorRoot(root_bytes).build_transaction({
+                'from': from_addr,
+                'nonce': nonce,
+                'gas': 100000,
+                'gasPrice': self.w3.eth.gas_price,
+                'chainId': self.w3.eth.chain_id
+            })
+            
+            signer_key = self.oracle_kms_id if self.oracle_kms_id else self.private_key
+            return self.secure_sign_and_send(tx, signer_key)
+        except Exception as e:
+            print(f"[BLOCKCHAIN] State root anchoring failed: {e}")
+            return None
 
     def verify_zk_proof(self, agent_address: str, proof: bytes, public_inputs: list):
         """Submits a ZK-Proof to the ReputationRegistry for verification."""
-        if not self.contract or not self.private_key:
+        if not self.contract:
             return None
             
-        from_addr = Account.from_key(self.private_key).address
-        nonce = self.w3.eth.get_transaction_count(from_addr)
-        
-        # public_inputs: [threshold, max_risk, agent_addr, state_root]
-        tx = self.contract.functions.verifyReputationZK(proof, public_inputs).build_transaction({
-            'from': from_addr,
-            'nonce': nonce,
-            'gas': 500000,
-            'gasPrice': self.w3.eth.gas_price
-        })
-        
-        return self.secure_sign_and_send(tx, self.private_key)
+        from_addr = self.get_oracle_address()
+        if not from_addr:
+            return None
+
+        try:
+            nonce = self.w3.eth.get_transaction_count(from_addr)
+            # public_inputs: [threshold, max_risk, agent_addr, state_root]
+            tx = self.contract.functions.verifyReputationZK(proof, public_inputs).build_transaction({
+                'from': from_addr,
+                'nonce': nonce,
+                'gas': 500000,
+                'gasPrice': self.w3.eth.gas_price,
+                'chainId': self.w3.eth.chain_id
+            })
+            
+            signer_key = self.oracle_kms_id if self.oracle_kms_id else self.private_key
+            return self.secure_sign_and_send(tx, signer_key)
+        except Exception as e:
+            print(f"[BLOCKCHAIN] ZK Proof verification submission failed: {e}")
+            return None
+
+    def register_xns_on_chain(self, handle: str, agent_address: str):
+        """Anchors an XNS handle to an agent address on-chain."""
+        if not self.xns_contract:
+            print("[BLOCKCHAIN] XNS contract not configured.")
+            return None
+
+        from_addr = self.get_oracle_address()
+        if not from_addr:
+            return None
+
+        try:
+            nonce = self.w3.eth.get_transaction_count(from_addr)
+            tx = self.xns_contract.functions.register(handle, self.w3.to_checksum_address(agent_address)).build_transaction({
+                'from': from_addr,
+                'nonce': nonce,
+                'gas': 150000,
+                'gasPrice': self.w3.eth.gas_price,
+                'chainId': self.w3.eth.chain_id
+            })
+            
+            signer_key = self.oracle_kms_id if self.oracle_kms_id else self.private_key
+            return self.secure_sign_and_send(tx, signer_key)
+        except Exception as e:
+            print(f"[BLOCKCHAIN] XNS registration failed: {e}")
+            return None
+
+    def bridge_reputation_cross_chain(self, destination_chain_selector: int, agent_address: str, fee_token: str = "0x0000000000000000000000000000000000000000"):
+        """Bridges an agent's reputation to another chain via CCIP."""
+        if not self.bridge_contract:
+            print("[BLOCKCHAIN] CCIP Bridge contract not configured.")
+            return None
+
+        from_addr = self.get_oracle_address()
+        if not from_addr:
+            return None
+
+        try:
+            nonce = self.w3.eth.get_transaction_count(from_addr)
+            # Default fee token is Native (address(0))
+            tx = self.bridge_contract.functions.bridgeReputation(
+                destination_chain_selector, 
+                self.w3.to_checksum_address(agent_address), 
+                self.w3.to_checksum_address(fee_token)
+            ).build_transaction({
+                'from': from_addr,
+                'nonce': nonce,
+                'gas': 400000,
+                'gasPrice': self.w3.eth.gas_price,
+                'chainId': self.w3.eth.chain_id,
+                'value': 0 # If fee_token is Native, CCIP will calculate fee which we might need to pre-fetch or over-provide
+            })
+            
+            # For simplicity, we assume the caller or the contract handles the fee appropriately.
+            # In a real system, we'd call routerClient.getFee() first.
+            
+            signer_key = self.oracle_kms_id if self.oracle_kms_id else self.private_key
+            return self.secure_sign_and_send(tx, signer_key)
+        except Exception as e:
+            print(f"[BLOCKCHAIN] CCIP Bridging failed: {e}")
+            return None
 
     def _load_abis(self):
         # Look for ABIs in standard locations
@@ -164,13 +278,51 @@ class IntegrityBlockchainService:
         """
         The production-grade signing gateway.
         """
-        if signer_key.startswith("kms:"):
-            print(f"[SECURITY] Routing tx to AWS KMS HSM (Key ID: {signer_key})")
-            return "0x_MOCKED_KMS_TX_HASH"
+        if signer_key and (str(signer_key).startswith("kms:") or (self.kms_service and signer_key == self.oracle_kms_id)):
+            key_id = str(signer_key).replace("kms:", "")
+            print(f"[SECURITY] Routing tx to AWS KMS HSM (Key ID: {key_id})")
+            
+            # Use existing service or create transient one if key_id differs
+            kms = self.kms_service if self.kms_service and self.kms_service.key_id == key_id else KmsService(key_id)
+            
+            try:
+                signed_tx_hex = kms.sign_transaction(transaction, self.w3)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx_hex)
+                return tx_hash.hex()
+            except Exception as e:
+                print(f"[SECURITY] KMS Transaction Signing Failed: {e}")
+                return None
         else:
             signed_tx = self.w3.eth.account.sign_transaction(transaction, private_key=signer_key)
             tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             return tx_hash.hex()
+
+    def sign_paymaster_op(self, user_op_hash: str) -> str:
+        """
+        Signs a ERC-4337 UserOperation hash for the IntegrityPaymaster.
+        Enables agents to perform 'gasless' transactions sponsored by the Oracle.
+        """
+        if not self.private_key and not self.kms_service:
+            return ""
+            
+        from eth_account.messages import encode_defunct
+        
+        # Convert hex string to bytes
+        hash_bytes = bytes.fromhex(user_op_hash.replace("0x", ""))
+        message = encode_defunct(hash_bytes)
+        # In Ethereum, sign_message expects the message, and it hashes it with the prefix.
+        # But for Paymaster, we often sign the hash directly.
+        # However, encode_defunct(hash_bytes) creates a message that will be hashed as:
+        # keccak256("\x19Ethereum Signed Message:\n32" + hash_bytes)
+        
+        if self.kms_service:
+            # For KMS, we sign the hash of the defunct message
+            from eth_account.messages import _hash_eip191_message
+            msghash = _hash_eip191_message(message)
+            return self.kms_service.sign_message(msghash)
+        else:
+            signed_message = self.w3.eth.account.sign_message(message, private_key=self.private_key)
+            return signed_message.signature.hex()
 
     def update_agent_reputation(self, agent_address: str, ais: int, tier: int):
         if not self.contract or (not self.private_key and not self.oracle_kms_id):

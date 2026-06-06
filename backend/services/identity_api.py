@@ -92,6 +92,7 @@ class AgentRegistrationRequest(BaseModel):
     xns_handle: Optional[str] = None
     tee_type: Optional[str] = "NONE"
     tee_measurement: Optional[str] = None
+    tee_attestation: Optional[Dict[str, Any]] = None
 
 class IdentityUpgradeRequest(BaseModel):
     agent_eth_address: str
@@ -110,6 +111,21 @@ class TierUpgradeRequest(BaseModel):
 
 class ProfileUpdateRequest(BaseModel):
     handle: str
+
+class XnsRegisterRequest(BaseModel):
+    eth_address: str
+    handle: str
+
+class XnsRegisterResponse(BaseModel):
+    status: str
+    xns_handle: str
+    eth_address: str
+    message: str
+
+class RevocationRequest(BaseModel):
+    agent_address: str
+    reason: str
+    evidence_hash: Optional[str] = None
 
 
 # ============================================================
@@ -186,15 +202,14 @@ class DIDResolver:
     SERVICE_BASE = os.getenv("API_BASE_URL", "https://api.xibalba.solutions")
 
     @staticmethod
-
-    def resolve(agent_address: str, agent_alias: str = "Unknown Agent", xns_handle: str = None) -> dict:
+    def resolve(agent_address: str, agent_alias: str = "Unknown Agent", xns_handle: str = None, is_revoked: bool = False) -> dict:
         """Resolves did:intg:<address> to a W3C compliant DID Document."""
         did = f"did:intg:{agent_address}"
         aka = [f"https://xibalba.solutions/agents/{agent_alias.lower().replace(' ', '_')}"]
         if xns_handle:
             aka.append(f"xns://{xns_handle}")
-            
-        return {
+
+        doc = {
             "@context": [
                 "https://www.w3.org/ns/did/v1",
                 "https://w3id.org/security/suites/jws-2020/v1"
@@ -221,6 +236,16 @@ class DIDResolver:
             }]
         }
 
+        if is_revoked:
+            doc["revocationMetadata"] = {
+                "status": "REVOKED",
+                "revokedAt": datetime.datetime.utcnow().isoformat(),
+                "reason": "Security compromise or administrative decommission"
+            }
+
+        return doc
+
+
     @staticmethod
     def reverse_resolve(did_string: str) -> Optional[str]:
         """Extracts the ETH address from a did:intg string."""
@@ -232,6 +257,8 @@ class DIDResolver:
 # ============================================================
 #  Verifiable Credential Issuer
 # ============================================================
+
+from .kms_service import KmsService
 
 class VCIssuer:
     """
@@ -257,9 +284,24 @@ class VCIssuer:
         }
 
         # Deterministic proof hash over credential content
-        proof_hash = hashlib.sha256(
-            json.dumps(credential_subject, sort_keys=True).encode()
-        ).hexdigest()
+        # For production-grade JWS, we should follow RFC 7515, but for the protocol 
+        # we sign the canonicalized JSON hash.
+        raw_subject = json.dumps(credential_subject, sort_keys=True)
+        proof_hash_bytes = hashlib.sha256(raw_subject.encode()).digest()
+        proof_hash_hex = proof_hash_bytes.hex()
+
+        # PRODUCTION: Use AWS KMS for institutional signatures
+        kms_id = os.getenv("XIBALBA_ORACLE_KMS_ID")
+        if kms_id:
+            try:
+                kms = KmsService(kms_id)
+                jws = kms.sign_message(proof_hash_bytes)
+                print(f"[IDENTITY] Issued KMS-signed VC for {agent_address}")
+            except Exception as e:
+                print(f"[IDENTITY] KMS Signing failed, falling back to mock: {e}")
+                jws = f"xib_sig_{proof_hash_hex[:32]}"
+        else:
+            jws = f"xib_sig_{proof_hash_hex[:32]}"
 
         return {
             "@context": [
@@ -276,7 +318,7 @@ class VCIssuer:
                 "created": datetime.datetime.utcnow().isoformat() + "Z",
                 "proofPurpose": "assertionMethod",
                 "verificationMethod": f"{VCIssuer.ISSUER_DID}#key-1",
-                "jws": f"xib_sig_{proof_hash[:32]}"
+                "jws": jws
             }
         }
 
@@ -313,6 +355,7 @@ async def resolve_did_document(agent_address: str, db: Session = Depends(get_db)
 async def resolve_identity(
     did: Optional[str] = None,
     xns: Optional[str] = None,
+    handle: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """
@@ -321,13 +364,14 @@ async def resolve_identity(
     - <handle>.intg → Agent profile.
     """
     agent = None
+    xns_val = xns or handle
     if did:
         eth_address = DIDResolver.reverse_resolve(did)
         if eth_address:
             agent = db.query(Agent).filter(Agent.eth_address == eth_address).first()
-    elif xns:
-        handle = xns if ".intg" in xns else f"{xns}.intg"
-        agent = db.query(Agent).filter(Agent.xns_handle == handle).first()
+    elif xns_val:
+        handle_name = xns_val if ".intg" in xns_val else f"{xns_val}.intg"
+        agent = db.query(Agent).filter(Agent.xns_handle == handle_name).first()
 
     if not agent:
         raise HTTPException(status_code=404, detail="Identity not found.")
@@ -345,6 +389,144 @@ async def resolve_identity(
         "trust_level": VCIssuer._ais_to_trust_level(capped_ais),
         "did_document": DIDResolver.resolve(agent.eth_address, agent.alias or "Agent", agent.xns_handle),
         "verifiable_credential": VCIssuer.issue_ais_credential(agent.eth_address, agent)
+    }
+
+
+# ============================================================
+#  XNS — Xibalba Name Service
+# ============================================================
+
+@router.get("/xns/{handle}")
+async def get_xns_handle(handle: str, db: Session = Depends(get_db)):
+    """
+    Resolves an XNS handle to an agent profile.
+    """
+    clean_handle = handle.lower().replace('@', '')
+    xns_handle = clean_handle if ".intg" in clean_handle else f"{clean_handle}.intg"
+    
+    agent = db.query(Agent).filter(Agent.xns_handle == xns_handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"XNS handle '{xns_handle}' not found.")
+    
+    return {
+        "xns_handle": agent.xns_handle,
+        "eth_address": agent.eth_address,
+        "alias": agent.alias,
+        "trust_level": VCIssuer._ais_to_trust_level(agent.current_ais)
+    }
+
+
+@router.post("/xns/register", response_model=XnsRegisterResponse)
+async def register_xns_handle(
+    request: XnsRegisterRequest, 
+    db: Session = Depends(get_db),
+    user: dict = Depends(verify_firebase_token)
+):
+    """
+    Claims an XNS handle for an existing agent.
+    Implements mainnet pricing:
+    - Premium Handles (< 5 chars): 5,000 ITK
+    - Standard Handles (>= 5 chars): 1,000 ITK
+    """
+    clean_handle = request.handle.lower().replace('@', '')
+    
+    # Validation: alphanumeric + hyphens
+    base = clean_handle.replace(".intg", "")
+    if not all(c.isalnum() or c == '-' for c in base) or not base:
+        raise HTTPException(status_code=400, detail="Handle must be alphanumeric (hyphens allowed).")
+        
+    xns_handle = f"{base}.intg"
+    
+    # 1. Uniqueness check
+    existing = db.query(Agent).filter(Agent.xns_handle == xns_handle).first()
+    if existing:
+        if existing.eth_address != request.eth_address:
+            raise HTTPException(status_code=409, detail=f"XNS handle '{xns_handle}' is already claimed.")
+        return {
+            "status": "ALREADY_OWNED",
+            "xns_handle": xns_handle,
+            "eth_address": request.eth_address,
+            "message": "You already own this handle."
+        }
+        
+    # 2. Agent ownership check
+    agent = db.query(Agent).filter(Agent.eth_address == request.eth_address).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+        
+    if agent.owner_uid != user["uid"]:
+        raise HTTPException(status_code=403, detail="Not authorized to register XNS for this agent.")
+
+    # 3. Pricing Logic
+    from database import UserProfile
+    profile = db.query(UserProfile).filter(UserProfile.owner_uid == user["uid"]).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User profile not found.")
+
+    price = 5000.0 if len(base) < 5 else 1000.0
+    if float(profile.itk_balance) < price:
+        raise HTTPException(status_code=402, detail=f"Insufficient ITK balance. Required: {price} ITK.")
+
+    # 4. Process Payment & Update agent
+    profile.itk_balance = float(profile.itk_balance) - price
+    agent.xns_handle = xns_handle
+    db.commit()
+    
+    return {
+        "status": "SUCCESS",
+        "xns_handle": xns_handle,
+        "eth_address": agent.eth_address,
+        "message": f"XNS handle '{xns_handle}' successfully linked. Price paid: {price} ITK."
+    }
+
+
+@router.post("/revoke")
+async def revoke_agent_identity(
+    request: RevocationRequest,
+    db: Session = Depends(get_db),
+    user: dict = Depends(verify_firebase_token)
+):
+    """
+    Administrative Revocation:
+    Deactivates an agent identity and marks it as revoked in the global registry.
+    Requires the request to come from the agent's owner.
+    """
+    from database import RevokedDID
+    
+    agent = db.query(Agent).filter(Agent.eth_address == request.agent_address).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+        
+    if agent.owner_uid != user["uid"]:
+        raise HTTPException(status_code=403, detail="Not authorized to revoke this identity.")
+        
+    # 1. Update Agent Status
+    agent.is_active = False
+    agent.sync_pending = True
+    
+    # 2. Record Revocation
+    revocation = RevokedDID(
+        did=f"did:intg:{agent.eth_address}",
+        agent_address=agent.eth_address,
+        reason=request.reason,
+        evidence_hash=request.evidence_hash,
+        revoked_by_uid=user["uid"]
+    )
+    db.add(revocation)
+    db.commit()
+    
+    # 3. On-chain revocation (update reputation to 0 and verify=false)
+    try:
+        from trust_api import blockchain
+        blockchain.update_agent_reputation(agent.eth_address, 0, 1)
+        print(f"[BLOCKCHAIN] Agent {agent.eth_address} revoked on-chain.")
+    except Exception as e:
+        print(f"[BLOCKCHAIN] Warning: On-chain revocation failed: {e}")
+        
+    return {
+        "status": "REVOKED",
+        "did": f"did:intg:{agent.eth_address}",
+        "message": "Identity successfully revoked and de-indexed from the protocol."
     }
 
 
@@ -391,7 +573,21 @@ async def register_agent(
             existing.xns_handle = request.xns_handle
         existing.tee_type = request.tee_type or existing.tee_type
         existing.tee_measurement = request.tee_measurement or existing.tee_measurement
-        existing.tee_verified = True if request.tee_type and request.tee_type != "NONE" else existing.tee_verified
+        
+        # Verify TEE Attestation if provided
+        if request.tee_attestation:
+            from verification_engine import AutonomousVerificationEngine
+            engine = AutonomousVerificationEngine()
+            is_valid, reason = engine.verify_tee_attestation(request.tee_attestation)
+            if is_valid:
+                existing.tee_verified = True
+                print(f"[IDENTITY] TEE Verified for {existing.eth_address}: {reason}")
+            else:
+                print(f"[IDENTITY] TEE Verification FAILED for {existing.eth_address}: {reason}")
+                existing.tee_verified = False
+        else:
+            existing.tee_verified = True if request.tee_type and request.tee_type != "NONE" else existing.tee_verified
+
         db.commit()
         return {
             "status": "UPDATED",
@@ -423,8 +619,23 @@ async def register_agent(
         gpu_hours_verified=0.0,
         tee_type=request.tee_type or "NONE",
         tee_measurement=request.tee_measurement,
-        tee_verified=True if request.tee_type and request.tee_type != "NONE" else False
+        tee_verified=False
     )
+
+    # Verify TEE Attestation if provided
+    if request.tee_attestation:
+        from verification_engine import AutonomousVerificationEngine
+        engine = AutonomousVerificationEngine()
+        is_valid, reason = engine.verify_tee_attestation(request.tee_attestation)
+        if is_valid:
+            new_agent.tee_verified = True
+            print(f"[IDENTITY] TEE Verified for NEW agent {new_agent.eth_address}: {reason}")
+        else:
+            print(f"[IDENTITY] TEE Verification FAILED for NEW agent {new_agent.eth_address}: {reason}")
+            new_agent.tee_verified = False
+    else:
+        new_agent.tee_verified = True if request.tee_type and request.tee_type != "NONE" else False
+
     db.add(new_agent)
     db.flush()
     
@@ -583,6 +794,10 @@ async def get_agent_identity_profile(identifier: str, db: Session = Depends(get_
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found.")
 
+    from database import RevokedDID
+    revocation = db.query(RevokedDID).filter(RevokedDID.agent_address == eth_address).first()
+    is_revoked = revocation is not None
+
     tier_ceilings = {1: 600, 2: 850, 3: 1000}
     ceiling = tier_ceilings.get(agent.verification_tier, 600)
     capped_ais = min(agent.current_ais, ceiling)
@@ -594,7 +809,8 @@ async def get_agent_identity_profile(identifier: str, db: Session = Depends(get_
         "ais_ceiling": ceiling,
         "current_ais": capped_ais,
         "trust_level": VCIssuer._ais_to_trust_level(capped_ais),
-        "did_document": DIDResolver.resolve(eth_address, agent.alias or "Agent", agent.xns_handle),
+        "is_revoked": is_revoked,
+        "did_document": DIDResolver.resolve(eth_address, agent.alias or "Agent", agent.xns_handle, is_revoked=is_revoked),
         "verifiable_credential": VCIssuer.issue_ais_credential(eth_address, agent),
         "tee_type": agent.tee_type or "NONE",
         "tee_measurement": agent.tee_measurement or "",

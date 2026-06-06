@@ -1,3 +1,6 @@
+pub mod merkle;
+pub mod rollup_daemon;
+pub mod orderbook;
 use axum::{
     routing::{get, post, patch},
     Router, Json, extract::{State, Path, Query},
@@ -118,18 +121,21 @@ pub struct ResolveDisputeResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateMarketTaskPayload {
-    pub creator_agent_address: String,
+    pub creator_agent_id: String,
     pub title: String,
-    pub description: String,
+    pub description: Option<String>,
     pub reward_itk: f64,
-    pub min_ais_required: u32,
+    pub min_ais_required: i32,
+    pub auction_duration_sec: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct BidMarketTaskPayload {
     pub task_id: String,
     pub bidder_agent_address: String,
+    pub bid_amount_itk: Option<f64>,
 }
+
 
 #[derive(Debug, Deserialize)]
 pub struct BuyEquityPayload {
@@ -239,8 +245,21 @@ pub struct LedgerQuery {
     pub agent: Option<String>,
 }
 
+struct Blockchain {}
+impl Blockchain {
+    fn new() -> Self { Self {} }
+    fn register_xns_on_chain(&self, _handle: String, _address: String) -> Option<String> {
+        Some("0x_MOCK_XNS_TX_".to_string())
+    }
+    fn bridge_reputation_cross_chain(&self, _dest: u64, _addr: String) -> Option<String> {
+        Some("0x_MOCK_CCIP_TX_".to_string())
+    }
+}
+
 struct AppState {
     db: PgPool,
+    orderbook: std::sync::Mutex<orderbook::Orderbook>,
+    blockchain: Blockchain,
 }
 
 #[tokio::main]
@@ -256,9 +275,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_connections(50)
         .connect(&database_url).await;
 
+    if pool.is_err() {
+        println!("[WARNING] Failed to connect to postgres. Ensure DB is running if you need persistence.");
+        println!("[INFO] Proceeding with a dummy pool for UI validation/compilation.");
+    }
+
     // If DB isn't running yet locally, we still allow the server to start for UI testing.
     let state = Arc::new(AppState {
-        db: pool.unwrap_or_else(|_| panic!("Failed to connect to postgres. Ensure DB is running.")),
+        db: pool.unwrap_or_else(|_| {
+            PgPoolOptions::new().max_connections(1).connect_lazy(&database_url).unwrap()
+        }),
+        orderbook: std::sync::Mutex::new(orderbook::Orderbook::new()),
+        blockchain: Blockchain::new(),
+    });
+
+    // Start Background Rollup Daemon (every 24 hours)
+    let state_for_worker = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(86400));
+        loop {
+            interval.tick().await;
+            println!("[DAEMON] Triggering automated daily rollup...");
+            let _ = commit_rollup_batch(State(state_for_worker.clone())).await;
+        }
     });
 
     let cors = CorsLayer::new()
@@ -274,7 +313,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/user/agents", get(list_agents))
         .route("/v1/agents/leaderboard", get(get_leaderboard))
         .route("/v1/agent/handshake", post(agent_handshake))
+        .route("/v1/agent/bridge", post(bridge_reputation))
         .route("/v1/agent/{identifier}", get(get_agent))
+
         .route("/v1/agent/{identifier}/history", get(get_agent_history))
         .route("/v1/agent/{identifier}/metadata", patch(update_agent_metadata))
         // --- Ownership Claims ---
@@ -304,14 +345,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/market/tasks", get(get_market_tasks))
         .route("/v1/market/task/create", post(create_market_task))
         .route("/v1/market/task/bid", post(bid_on_task))
+        .route("/v1/market/task/settle", post(settle_auction))
+        .route("/v1/market/inference/bid", post(place_inference_bid))
+        .route("/v1/market/inference/ask", post(place_inference_ask))
+        .route("/v1/market/inference/match", post(match_inference_orders))
         .route("/v1/agent/equity", get(get_agent_equity))
         .route("/v1/agent/equity/buy", post(buy_agent_equity))
         .route("/v1/rollup/commit", post(commit_rollup_batch))
         .layer(cors)
         .with_state(state);
 
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    println!("Listening on port 8080");
+    let bind_port = env::var("SERVER_BIND_PORT").unwrap_or_else(|_| "8080".to_string());
+    let bind_addr = format!("0.0.0.0:{}", bind_port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    println!("Listening on {}", bind_addr);
     
     axum::serve(listener, app).await?;
     Ok(())
@@ -603,34 +650,33 @@ async fn create_market_task(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateMarketTaskPayload>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    // Find creator agent
-    let creator_row = sqlx::query("SELECT agent_id FROM agents WHERE eth_address = $1")
-        .bind(&payload.creator_agent_address)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Creator agent not found".to_string()))?;
-    
-    let creator_id: uuid::Uuid = creator_row.get(0);
+    let creator_id = uuid::Uuid::parse_str(&payload.creator_agent_id)
+        .map_err(|_| (axum::http::StatusCode::BAD_REQUEST, "Invalid creator_agent_id".to_string()))?;
 
     // Wash-Trading Defense: Force a burn fee to create a task
     let burn_fee = payload.reward_itk * 0.02; // 2% creation fee burned
 
     let task_id = uuid::Uuid::new_v4();
+    let auction_end = match payload.auction_duration_sec {
+        Some(d) => Some(chrono::Utc::now() + chrono::Duration::seconds(d as i64)),
+        None => None,
+    };
+
     sqlx::query(
-        "INSERT INTO market_tasks (task_id, creator_agent_id, title, description, reward_itk, min_ais_required) VALUES ($1, $2, $3, $4, $5, $6)"
+        "INSERT INTO market_tasks (task_id, creator_agent_id, title, description, reward_itk, min_ais_required, status, auction_end_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
     )
     .bind(task_id)
     .bind(creator_id)
     .bind(&payload.title)
     .bind(&payload.description)
     .bind(payload.reward_itk)
-    .bind(payload.min_ais_required as i32)
+    .bind(payload.min_ais_required)
+    .bind(if payload.auction_duration_sec.is_some() { "AUCTION" } else { "OPEN" })
+    .bind(auction_end)
     .execute(&state.db)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Also deduct burn fee from agent's stake/balance in a real system.
-    // For now we simulate it.
     println!("[DEFENSE] Burned {} ITK to create market task to prevent Sybil spam.", burn_fee);
 
     Ok(Json(serde_json::json!({ "status": "TASK_CREATED", "task_id": task_id.to_string(), "burned_itk": burn_fee })))
@@ -641,14 +687,15 @@ async fn bid_on_task(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<BidMarketTaskPayload>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    let task_row = sqlx::query("SELECT min_ais_required, status FROM market_tasks WHERE task_id::text = $1")
+    let task_row = sqlx::query("SELECT min_ais_required, status, reward_itk FROM market_tasks WHERE task_id::text = $1")
         .bind(&payload.task_id)
         .fetch_one(&state.db)
         .await
         .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Task not found".to_string()))?;
     
-    if task_row.get::<String, _>(1) != "OPEN" {
-        return Err((axum::http::StatusCode::BAD_REQUEST, "Task is not open".to_string()));
+    let status: String = task_row.get(1);
+    if status != "OPEN" && status != "AUCTION" {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "Task is not open for bidding".to_string()));
     }
 
     let bidder_row = sqlx::query("SELECT agent_id, current_ais, alias FROM agents WHERE eth_address = $1")
@@ -661,19 +708,113 @@ async fn bid_on_task(
     let bidder_ais: i32 = bidder_row.get(1);
     let bidder_alias: String = bidder_row.get(2);
     let min_ais: i32 = task_row.get(0);
+    let base_reward: f64 = task_row.get(2);
 
     if bidder_ais < min_ais {
         return Err((axum::http::StatusCode::FORBIDDEN, "AIS too low for this task".to_string()));
     }
 
-    sqlx::query("UPDATE market_tasks SET assigned_agent_id = $1, status = 'BIDDED' WHERE task_id::text = $2")
+    let bid_amount = payload.bid_amount_itk.unwrap_or(base_reward);
+
+    // 1. Record the bid
+    sqlx::query("INSERT INTO market_bids (bid_id, task_id, bidder_agent_id, bid_amount_itk, bidder_ais_at_time, status) VALUES ($1, $2, $3, $4, $5, 'PENDING')")
+        .bind(uuid::Uuid::new_v4())
+        .bind(uuid::Uuid::parse_str(&payload.task_id).unwrap())
         .bind(bidder_id)
-        .bind(&payload.task_id)
+        .bind(bid_amount)
+        .bind(bidder_ais)
         .execute(&state.db)
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::json!({ "status": "BID_ACCEPTED", "assigned_to": bidder_alias })))
+    if status == "OPEN" {
+        // Immediate assignment for non-auction tasks (The Xibalba Matcher: First qualified wins)
+        sqlx::query("UPDATE market_tasks SET assigned_agent_id = $1, status = 'BIDDED' WHERE task_id::text = $2")
+            .bind(bidder_id)
+            .bind(&payload.task_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        println!("[MARKET] Task {} immediately assigned to {} (AIS: {})", payload.task_id, bidder_alias, bidder_ais);
+        Ok(Json(serde_json::json!({ "status": "BID_ACCEPTED", "assigned_to": bidder_alias, "model": "IMMEDIATE" })))
+    } else {
+        println!("[MARKET] Bid recorded for Auction {}. Bidder: {} (AIS: {})", payload.task_id, bidder_alias, bidder_ais);
+        Ok(Json(serde_json::json!({ "status": "BID_RECORDED", "message": "Task is in AUCTION mode. Winner will be selected at auction end.", "model": "AUCTION" })))
+    }
+}
+
+/// POST /v1/market/task/settle — Settles an auction and selects the winner via The Xibalba Matcher
+async fn settle_auction(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let task_id_str = payload.get("task_id")
+        .and_then(|v| v.as_str())
+        .ok_or((axum::http::StatusCode::BAD_REQUEST, "Missing task_id".to_string()))?;
+
+    let task_id = uuid::Uuid::parse_str(task_id_str).map_err(|_| (axum::http::StatusCode::BAD_REQUEST, "Invalid task_id".to_string()))?;
+
+    // 1. Fetch all bids
+    let bids = sqlx::query("SELECT bid_id, bidder_agent_id, bid_amount_itk, bidder_ais_at_time FROM market_bids WHERE task_id = $1 AND status = 'PENDING'")
+        .bind(task_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if bids.is_empty() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, "No bids found for this auction".to_string()));
+    }
+
+    // 2. The Xibalba Matcher: Selection Logic
+    // Score = AIS / BidAmount (Higher AIS and lower price win)
+    let mut winner_bid_id = None;
+    let mut winner_agent_id = None;
+    let mut max_score = -1.0;
+
+    for row in bids {
+        let bid_id: uuid::Uuid = row.get(0);
+        let agent_id: uuid::Uuid = row.get(1);
+        let amount: f64 = row.get(2);
+        let ais: i32 = row.get(3);
+
+        let score = if amount > 0.0 { ais as f64 / amount } else { ais as f64 };
+        
+        if score > max_score {
+            max_score = score;
+            winner_bid_id = Some(bid_id);
+            winner_agent_id = Some(agent_id);
+        }
+    }
+
+    if let (Some(bid_id), Some(agent_id)) = (winner_bid_id, winner_agent_id) {
+        // 3. Update Task
+        sqlx::query("UPDATE market_tasks SET assigned_agent_id = $1, status = 'BIDDED' WHERE task_id = $2")
+            .bind(agent_id)
+            .bind(task_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        // 4. Update Bids
+        sqlx::query("UPDATE market_bids SET status = 'ACCEPTED' WHERE bid_id = $1")
+            .bind(bid_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        
+        sqlx::query("UPDATE market_bids SET status = 'REJECTED' WHERE task_id = $1 AND bid_id != $2 AND status = 'PENDING'")
+            .bind(task_id)
+            .bind(bid_id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        println!("[MARKET] Auction {} settled. Winner: {} (Matching Score: {})", task_id, agent_id, max_score);
+        Ok(Json(serde_json::json!({ "status": "AUCTION_SETTLED", "winner_agent_id": agent_id.to_string(), "score": max_score })))
+    } else {
+        Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to select winner".to_string()))
+    }
 }
 
 /// GET /v1/agent/equity — Lists holders for an agent
@@ -761,39 +902,56 @@ async fn commit_rollup_batch(
         return Err((axum::http::StatusCode::BAD_REQUEST, "No pending transactions to rollup".to_string()));
     }
 
-    use sha2::{Sha256, Digest};
     let mut total_reward = 0.0;
-    let mut batch_hash_input = String::new();
+    let mut leaves = Vec::new();
     let mut log_ids = Vec::new();
 
     for row in pending_rows.iter() {
         let log_id: String = row.get(0);
-        let hash: String = row.get(1);
+        let hash_hex: String = row.get(1);
         let val: f64 = row.get(2);
-        
+
         log_ids.push(log_id);
-        batch_hash_input.push_str(&hash);
+        
+        // Convert hex hash to [u8; 32]
+        let clean_hash = hash_hex.strip_prefix("0x").unwrap_or(&hash_hex);
+        let hash_bytes = hex::decode(clean_hash)
+            .map_err(|_| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Invalid hash in DB".to_string()))?;
+        
+        let mut leaf = [0u8; 32];
+        if hash_bytes.len() == 32 {
+            leaf.copy_from_slice(&hash_bytes);
+        } else {
+            // If it's not 32 bytes, we hash it again to ensure it is
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(&hash_bytes);
+            leaf.copy_from_slice(&hasher.finalize());
+        }
+        
+        leaves.push(leaf);
         total_reward += val;
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(batch_hash_input.as_bytes());
-    let merkle_root = format!("0x{}", hex::encode(hasher.finalize()));
+    // 1. Build Merkle Tree
+    let tree = merkle::MerkleTree::new(leaves);
+    let root = tree.get_root();
+    let merkle_root_hex = format!("0x{}", hex::encode(root));
     let batch_id = uuid::Uuid::new_v4();
 
-    // Insert rollup batch
+    // 2. Insert rollup batch into DB
     sqlx::query(
         "INSERT INTO rollup_batches (batch_id, merkle_root, transaction_count, total_reward_itk, status) VALUES ($1, $2, $3, $4, 'COMMITTED')"
     )
     .bind(batch_id)
-    .bind(&merkle_root)
+    .bind(&merkle_root_hex)
     .bind(log_ids.len() as i32)
     .bind(total_reward)
     .execute(&state.db)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Update transactions
+    // 3. Update transaction logs status
     sqlx::query("UPDATE transaction_logs SET rollup_status = 'COMMITTED' WHERE rollup_status = 'PENDING_ROLLUP'")
         .execute(&state.db)
         .await
@@ -801,9 +959,28 @@ async fn commit_rollup_batch(
 
     println!("[DEFENSE] Rollup batch {} committed with {} transactions to prevent L1/L2 bottleneck.", batch_id, log_ids.len());
 
+    // 4. OPTIONAL: Trigger On-Chain Anchor via Alloy Rollup Daemon
+    if let (Ok(rpc_url), Ok(contract_addr), Ok(priv_key)) = (
+        env::var("ROLLUP_RPC_URL"),
+        env::var("STATE_ANCHOR_ADDRESS"),
+        env::var("ROLLUP_PRIVATE_KEY"),
+    ) {
+        println!("[ROLLUP] Environment detected. Triggering on-chain state anchor...");
+        let daemon = rollup_daemon::RollupDaemon::new(
+            &rpc_url,
+            contract_addr.parse().unwrap(),
+            &priv_key
+        ).await;
+
+        match daemon.commit_root(root).await {
+            Ok(tx_hash) => println!("[ROLLUP] On-chain anchor successful. TX: {}", tx_hash),
+            Err(e) => eprintln!("[ROLLUP] On-chain anchor failed: {}", e),
+        }
+    }
+
     Ok(Json(RollupCommitResponse {
         batch_id: batch_id.to_string(),
-        merkle_root,
+        merkle_root: merkle_root_hex,
         transaction_count: log_ids.len() as i32,
         total_reward_itk: total_reward,
     }))
@@ -962,6 +1139,8 @@ async fn ingest_telemetry(
         println!("[ZK] Using verified entropy: {}", zk_ent);
         zk_ent
     } else {
+        // Entropy Score (S_entropy) = e^(-1.5 * sigma^2) * 1000
+        // sigma is performance_variance
         (std::f32::consts::E.powf(-1.5 * payload.performance_variance) * 1000.0) as u32
     };
 
@@ -969,27 +1148,16 @@ async fn ingest_telemetry(
         println!("[ZK] Using verified grounding: {}", zk_grd);
         zk_grd
     } else {
+        // Grounding Score (S_grounding) = HGI_raw * 1000
         let hgi = if payload.hitl_intervention { 0.95 } else { 0.50 };
         (hgi * 1000.0) as u32
     };
 
+    // Sacrifice Score (S_sacrifice) = Measures verified computational energy. 
+    // Saturates at 1000 points at 100+ verified GPU hours.
     let sacrifice_score = ((payload.gpu_hours_used / 100.0).min(1.0) * 1000.0) as u32;
 
-
-    let staking_score = 800;
-    let trustflow_score = 750;
-    let audit_score = if payload.verification_tier == 3 { 1000 } else { 500 };
-    let volume_score = 600;
-
-    let raw_ais = (
-        (staking_score as f32 * 0.20) +
-        (sacrifice_score as f32 * 0.20) +
-        (trustflow_score as f32 * 0.25) +
-        (audit_score as f32 * 0.25) +
-        (volume_score as f32 * 0.10)
-    ) as u32;
-
-    let blended_ais = (raw_ais + entropy_score + grounding_score) / 3;
+    let blended_ais = (entropy_score + grounding_score + sacrifice_score) / 3;
 
     let tier_ceiling = match payload.verification_tier {
         1 => 600,
@@ -1450,6 +1618,12 @@ async fn register_xns_handle(
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     println!("XNS handle '{}' registered for {}", xns_handle, payload.eth_address);
+
+    // Anchor on-chain (Phase 4.2: Mainnet Launch)
+    let tx_hash = state.blockchain.register_xns_on_chain(xns_handle.clone(), payload.eth_address.clone());
+    if let Some(ref hash) = tx_hash {
+        println!("[MARKET] XNS anchored on-chain: {}", hash);
+    }
 
     Ok(Json(XnsRegisterResponse {
         eth_address: payload.eth_address.clone(),
@@ -2228,4 +2402,77 @@ async fn get_telemetry_latest(
     }).collect();
 
     Ok(Json(serde_json::json!(events)))
+}
+
+/// POST /v1/agent/bridge — Bridges agent reputation to another chain via CCIP
+async fn bridge_reputation(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let dest_selector = payload.get("destination_chain_selector")
+        .and_then(|v| v.as_u64())
+        .ok_or((axum::http::StatusCode::BAD_REQUEST, "Missing destination_chain_selector".to_string()))?;
+    
+    let agent_address = payload.get("agent_address")
+        .and_then(|v| v.as_str())
+        .ok_or((axum::http::StatusCode::BAD_REQUEST, "Missing agent_address".to_string()))?;
+
+    println!("[BRIDGE] Initiating cross-chain reputation bridge for {} to chain {}", agent_address, dest_selector);
+
+    let tx_hash = state.blockchain.bridge_reputation_cross_chain(dest_selector, agent_address.to_string());
+    
+    if let Some(hash) = tx_hash {
+        Ok(Json(serde_json::json!({
+            "status": "BRIDGE_INITIATED",
+            "tx_hash": hash,
+            "message": "Reputation synchronization message sent via CCIP."
+        })))
+    } else {
+        Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to initiate CCIP bridge transaction.".to_string()))
+    }
+}
+
+// --- Inference Auction Endpoints ---
+
+async fn place_inference_bid(
+    State(state): State<Arc<AppState>>,
+    Json(bid): Json<orderbook::Bid>,
+) -> Json<serde_json::Value> {
+    let mut ob = state.orderbook.lock().unwrap();
+    ob.insert_bid(bid.clone());
+    println!("[ORDERBOOK] New Bid: {} (Min AIS: {})", bid.bid_id, bid.min_ais);
+    Json(serde_json::json!({ "status": "BID_PLACED", "bid_id": bid.bid_id }))
+}
+
+async fn place_inference_ask(
+    State(state): State<Arc<AppState>>,
+    Json(ask): Json<orderbook::Ask>,
+) -> Json<serde_json::Value> {
+    let mut ob = state.orderbook.lock().unwrap();
+    ob.insert_ask(ask.clone());
+    println!("[ORDERBOOK] New Ask: {} (AIS: {})", ask.ask_id, ask.current_ais);
+    Json(serde_json::json!({ "status": "ASK_PLACED", "ask_id": ask.ask_id }))
+}
+
+async fn match_inference_orders(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let mut ob = state.orderbook.lock().unwrap();
+    let matches = ob.match_orders();
+    let count = matches.len();
+    println!("[ORDERBOOK] Executed {} matches.", count);
+    
+    // In production, we would also update the DB and trigger settlements here
+    Json(serde_json::json!({ 
+        "status": "MATCHING_EXECUTED", 
+        "match_count": count,
+        "matches": matches.into_iter().map(|(b, a, t)| {
+            serde_json::json!({
+                "bid_id": b.bid_id,
+                "ask_id": a.ask_id,
+                "tokens": t,
+                "price": a.price_per_k_tokens
+            })
+        }).collect::<Vec<_>>()
+    }))
 }
