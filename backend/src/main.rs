@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::env;
+use sha2::{Sha256, Digest};
 
 // --- DTOs ---
 
@@ -60,8 +61,11 @@ pub struct TelemetryPayload {
     // --- ZK-PROOF FIELDS (Phase 1) ---
     pub zk_proof: Option<String>,
     pub integrity_commitment: Option<String>,
-    pub avg_entropy: Option<u32>,
-    pub avg_grounding: Option<u32>,
+    pub avg_entropy: Option<f32>,
+    pub avg_grounding: Option<f32>,
+    pub batch_size: Option<u32>,
+    pub agent_did: Option<String>,
+    pub hardware_fingerprint: Option<String>,
     pub metadata: Option<serde_json::Value>,
 
     // --- COMPLIANCE & GOVERNANCE (HIPAA/Finance) ---
@@ -125,8 +129,87 @@ pub struct CreateMarketTaskPayload {
     pub title: String,
     pub description: Option<String>,
     pub reward_itk: f64,
+    pub budget_itk: Option<f64>, // Total escrow budget
     pub min_ais_required: i32,
     pub auction_duration_sec: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditRequestPayload {
+    pub agent_address: String,
+    pub audit_type: String, // AUTOMATED, MANUAL_DEEP_DIVE, PLATINUM
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StakePayload {
+    pub amount_itk: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BorrowPayload {
+    pub amount_itk: f64,
+    pub term_days: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RepayPayload {
+    pub loan_id: String,
+    pub amount_itk: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LoanResponse {
+    pub loan_id: String,
+    pub principal: f64,
+    pub interest_rate: f64,
+    pub repaid_amount: f64,
+    pub status: String,
+    pub due_date: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreditProfileResponse {
+    pub credit_score: i32,
+    pub max_borrow_limit: f64,
+    pub total_borrowed: f64,
+    pub active_loans: Vec<LoanResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeployContractPayload {
+    pub owner_address: String,
+    pub contract_type: String,
+    pub language: String,
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListMarketContractPayload {
+    pub contract_address: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub reward_itk: f64,
+    pub min_ais_required: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProvenanceLogResponse {
+    pub log_id: String,
+    pub action: String,
+    pub input_hash: String,
+    pub output_hash: String,
+    pub model_used: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StabilityBenchmarkResponse {
+    pub model_name: String,
+    pub provider_name: String,
+    pub simulated_ais: i32,
+    pub stability_metric: f64,
+    pub grounding_metric: f64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +236,8 @@ pub struct MarketTaskResponse {
     pub reward_itk: f64,
     pub min_ais_required: i32,
     pub status: String,
+    pub linked_contract_address: Option<String>,
+    pub is_factory_contract: bool,
     pub created_at: String,
 }
 
@@ -264,11 +349,13 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
     println!("Starting Xibalba Oracle Backend (Rust/Axum)...");
 
     // Load DB from .env (in real environment)
     // For MVP compilation, we allow fallback or mock pool if DSN is missing
     let database_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/integrity".to_string());
+    println!("DEBUG: Using DATABASE_URL: {}", database_url);
     
     // Connect to Postgres
     let pool = PgPoolOptions::new()
@@ -293,9 +380,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state_for_worker = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(86400));
+        interval.tick().await; // First tick returns immediately
         loop {
-            interval.tick().await;
-            println!("[DAEMON] Triggering automated daily rollup...");
+            interval.tick().await; // Wait for next interval
+            println!("[DAEMON] Processing automated daily rollup check...");
             let _ = commit_rollup_batch(State(state_for_worker.clone())).await;
         }
     });
@@ -315,8 +403,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/agent/handshake", post(agent_handshake))
         .route("/v1/agent/bridge", post(bridge_reputation))
         .route("/v1/agent/{identifier}", get(get_agent))
-
         .route("/v1/agent/{identifier}/history", get(get_agent_history))
+        .route("/v1/agent/{identifier}/identity", get(resolve_did))
+        .route("/v1/agent/{identifier}/reputation/history", get(get_agent_history))
+        .route("/v1/agent/{identifier}/contracts", get(get_agent_contracts))
         .route("/v1/agent/{identifier}/metadata", patch(update_agent_metadata))
         // --- Ownership Claims ---
         .route("/v1/agents/claim", post(claim_ownership))
@@ -329,7 +419,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/telemetry/latest", get(get_telemetry_latest))
         // --- Protocol-wide ---
         .route("/v1/protocol/stats", get(get_protocol_stats))
+        .route("/v1/contracts/ledger", get(get_ledger_history))
         .route("/v1/ledger/history", get(get_ledger_history))
+        // --- Expansions ---
+        .route("/v1/agent/{identifier}/stake", post(stake_itk))
+        .route("/v1/agent/{identifier}/unstake", post(unstake_itk))
+        .route("/v1/agent/{identifier}/provenance", get(get_provenance))
+        .route("/v1/agent/{identifier}/credit/profile", get(get_credit_profile))
+        .route("/v1/agent/{identifier}/credit/borrow", post(borrow_itk))
+        .route("/v1/stability/benchmarks", get(get_benchmarks))
+        .route("/v1/market/task/fund-with-loan", post(create_task_funded_by_loan))
+        .route("/v1/agent/{identifier}/credit/repay", post(repay_loan))
         // --- Disputes ---
         .route("/v1/disputes/raise", post(raise_dispute))
         .route("/v1/disputes/resolve", post(resolve_dispute))
@@ -346,6 +446,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/market/task/create", post(create_market_task))
         .route("/v1/market/task/bid", post(bid_on_task))
         .route("/v1/market/task/settle", post(settle_auction))
+        .route("/v1/contracts/factory/deploy", post(deploy_contract))
+        .route("/v1/contracts/list-market", post(list_contract_in_market))
+        .route("/v1/audit/request", post(request_audit))
         .route("/v1/market/inference/bid", post(place_inference_bid))
         .route("/v1/market/inference/ask", post(place_inference_ask))
         .route("/v1/market/inference/match", post(match_inference_orders))
@@ -541,7 +644,7 @@ async fn list_agents(
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     println!("Fetching all agents...");
     let rows = sqlx::query(
-        "SELECT agent_id::text, eth_address, current_ais, gpu_hours_verified::float8, performance_entropy::float8, metadata, owner_address FROM agents"
+        "SELECT agent_id::text, eth_address, current_ais, gpu_hours_verified::float8, performance_entropy::float8, metadata, owner_address, staked_itk::float8 FROM agents"
     )
     .fetch_all(&state.db)
     .await
@@ -555,6 +658,7 @@ async fn list_agents(
         let performance_entropy: f64 = row.get(4);
         let metadata: serde_json::Value = row.get(5);
         let owner_address: Option<String> = row.get(6);
+        let staked_itk: f64 = row.get(7);
         serde_json::json!({
             "agent_id": agent_id,
             "eth_address": eth_address,
@@ -562,10 +666,10 @@ async fn list_agents(
             "gpu_hours_verified": gpu_hours_verified,
             "performance_entropy": performance_entropy,
             "metadata": metadata,
-            "owner_address": owner_address
+            "owner_address": owner_address,
+            "staked_itk": staked_itk
         })
     }).collect();
-
 
     Ok(Json(serde_json::json!(agents)))
 }
@@ -625,7 +729,7 @@ async fn get_market_tasks(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<MarketTaskResponse>>, (axum::http::StatusCode, String)> {
     let rows = sqlx::query(
-        "SELECT task_id::text, creator_agent_id::text, title, description, reward_itk::float8, min_ais_required, status, created_at::text FROM market_tasks WHERE status = 'OPEN'"
+        "SELECT task_id::text, creator_agent_id::text, title, description, reward_itk::float8, min_ais_required, status, created_at::text, linked_contract_address, is_factory_contract FROM market_tasks WHERE status = 'OPEN'"
     )
     .fetch_all(&state.db)
     .await
@@ -640,6 +744,8 @@ async fn get_market_tasks(
         min_ais_required: r.get(5),
         status: r.get(6),
         created_at: r.get(7),
+        linked_contract_address: r.get(8),
+        is_factory_contract: r.get(9),
     }).collect();
 
     Ok(Json(tasks))
@@ -653,7 +759,26 @@ async fn create_market_task(
     let creator_id = uuid::Uuid::parse_str(&payload.creator_agent_id)
         .map_err(|_| (axum::http::StatusCode::BAD_REQUEST, "Invalid creator_agent_id".to_string()))?;
 
-    // Wash-Trading Defense: Force a burn fee to create a task
+    // --- High-Integrity Validation ---
+    // 1. Check creator AIS and Stake
+    let creator_row = sqlx::query("SELECT current_ais, staked_itk::float8 FROM agents WHERE agent_id = $1")
+        .bind(creator_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Creator agent not found".to_string()))?;
+    
+    let creator_ais: i32 = creator_row.get(0);
+    let creator_stake: f64 = creator_row.get(1);
+
+    if creator_ais < 400 {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Agent AIS too low to create market tasks (Min 400 required)".to_string()));
+    }
+
+    if creator_stake < (payload.reward_itk * 2.0) {
+         return Err((axum::http::StatusCode::PAYMENT_REQUIRED, format!("Insufficient ITK Bond. You must stake at least {} ITK (2x reward) to post this task.", payload.reward_itk * 2.0)));
+    }
+
+    // 2. Wash-Trading Defense: Force a burn fee
     let burn_fee = payload.reward_itk * 0.02; // 2% creation fee burned
 
     let task_id = uuid::Uuid::new_v4();
@@ -966,15 +1091,19 @@ async fn commit_rollup_batch(
         env::var("ROLLUP_PRIVATE_KEY"),
     ) {
         println!("[ROLLUP] Environment detected. Triggering on-chain state anchor...");
-        let daemon = rollup_daemon::RollupDaemon::new(
+        let daemon_res = rollup_daemon::create_rollup_daemon(
             &rpc_url,
             contract_addr.parse().unwrap(),
             &priv_key
         ).await;
 
-        match daemon.commit_root(root).await {
-            Ok(tx_hash) => println!("[ROLLUP] On-chain anchor successful. TX: {}", tx_hash),
-            Err(e) => eprintln!("[ROLLUP] On-chain anchor failed: {}", e),
+        if let Ok(daemon) = daemon_res {
+            match daemon.commit_root(root).await {
+                Ok(tx_hash) => println!("[ROLLUP] On-chain anchor successful. TX: {}", tx_hash),
+                Err(e) => eprintln!("[ROLLUP] On-chain anchor failed: {}", e),
+            }
+        } else if let Err(e) = daemon_res {
+            eprintln!("[ROLLUP] Failed to initialize daemon: {}", e);
         }
     }
 
@@ -1136,8 +1265,13 @@ async fn ingest_telemetry(
     
     // ZK-ENHANCED LOGIC (Phase 1): Prefer metrics verified by ZK-proof if available
     let entropy_score = if let Some(zk_ent) = payload.avg_entropy {
-        println!("[ZK] Using verified entropy: {}", zk_ent);
-        zk_ent
+        println!("[ZK] Using verified entropy metric: {}", zk_ent);
+        // If it's a 0-1 metric, apply stability formula. If already a score, use directly.
+        if zk_ent <= 1.0 {
+            (std::f32::consts::E.powf(-1.5 * zk_ent) * 1000.0) as u32
+        } else {
+            zk_ent as u32
+        }
     } else {
         // Entropy Score (S_entropy) = e^(-1.5 * sigma^2) * 1000
         // sigma is performance_variance
@@ -1145,8 +1279,12 @@ async fn ingest_telemetry(
     };
 
     let grounding_score = if let Some(zk_grd) = payload.avg_grounding {
-        println!("[ZK] Using verified grounding: {}", zk_grd);
-        zk_grd
+        println!("[ZK] Using verified grounding metric: {}", zk_grd);
+        if zk_grd <= 1.0 {
+            (zk_grd * 1000.0) as u32
+        } else {
+            zk_grd as u32
+        }
     } else {
         // Grounding Score (S_grounding) = HGI_raw * 1000
         let hgi = if payload.hitl_intervention { 0.95 } else { 0.50 };
@@ -1304,9 +1442,9 @@ async fn get_agent(
     let is_uuid = identifier.len() == 36;
     
     let query_str = if is_uuid {
-        "SELECT agent_id::text, eth_address, current_ais, gpu_hours_verified::float8, performance_entropy::float8 FROM agents WHERE agent_id::text = $1"
+        "SELECT agent_id::text, eth_address, current_ais, gpu_hours_verified::float8, performance_entropy::float8, staked_itk::float8 FROM agents WHERE agent_id::text = $1"
     } else {
-        "SELECT agent_id::text, eth_address, current_ais, gpu_hours_verified::float8, performance_entropy::float8 FROM agents WHERE eth_address = $1"
+        "SELECT agent_id::text, eth_address, current_ais, gpu_hours_verified::float8, performance_entropy::float8, staked_itk::float8 FROM agents WHERE eth_address = $1"
     };
 
     let binder = sqlx::query(query_str).bind(&identifier);
@@ -1322,13 +1460,15 @@ async fn get_agent(
         let current_ais: i32 = row.get(2);
         let gpu_hours_verified: f64 = row.get(3);
         let performance_entropy: f64 = row.get(4);
+        let staked_itk: f64 = row.get(5);
 
         Ok(Json(serde_json::json!({
             "agent_id": agent_id,
             "eth_address": eth_address,
             "current_ais": current_ais,
             "gpu_hours_verified": gpu_hours_verified,
-            "performance_entropy": performance_entropy
+            "performance_entropy": performance_entropy,
+            "staked_itk": staked_itk
         })))
     } else {
         Err((axum::http::StatusCode::NOT_FOUND, "Agent not found".to_string()))
@@ -2476,3 +2616,428 @@ async fn match_inference_orders(
         }).collect::<Vec<_>>()
     }))
 }
+
+// --- NEW EXPANSION ENDPOINTS ---
+
+async fn stake_itk(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+    Json(payload): Json<StakePayload>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let rows_affected = sqlx::query("UPDATE agents SET staked_itk = staked_itk + $1 WHERE eth_address = $2")
+        .bind(payload.amount_itk)
+        .bind(&identifier)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .rows_affected();
+
+    if rows_affected == 0 {
+        return Err((axum::http::StatusCode::NOT_FOUND, "Agent not found".to_string()));
+    }
+    
+    Ok(Json(serde_json::json!({ "status": "STAKED", "amount": payload.amount_itk })))
+}
+
+async fn unstake_itk(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+    Json(payload): Json<StakePayload>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let rows_affected = sqlx::query("UPDATE agents SET staked_itk = GREATEST(0, staked_itk - $1) WHERE eth_address = $2")
+        .bind(payload.amount_itk)
+        .bind(&identifier)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .rows_affected();
+
+    if rows_affected == 0 {
+        return Err((axum::http::StatusCode::NOT_FOUND, "Agent not found".to_string()));
+    }
+    
+    Ok(Json(serde_json::json!({ "status": "UNSTAKED", "amount": payload.amount_itk })))
+}
+
+async fn get_provenance(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+) -> Result<Json<Vec<ProvenanceLogResponse>>, (axum::http::StatusCode, String)> {
+    let rows = sqlx::query(
+        "SELECT log_id::text, action, input_hash, output_hash, model_used, p.created_at::text \
+         FROM provenance_logs p JOIN agents a ON p.agent_id = a.agent_id \
+         WHERE a.eth_address = $1 ORDER BY p.created_at DESC LIMIT 100"
+    )
+    .bind(&identifier)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let logs = rows.into_iter().map(|r| ProvenanceLogResponse {
+        log_id: r.get(0),
+        action: r.get(1),
+        input_hash: r.get(2),
+        output_hash: r.get(3),
+        model_used: r.get(4),
+        created_at: r.get(5),
+    }).collect();
+
+    Ok(Json(logs))
+}
+
+async fn get_benchmarks(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<StabilityBenchmarkResponse>>, (axum::http::StatusCode, String)> {
+    let rows = sqlx::query(
+        "SELECT model_name, provider_name, simulated_ais, stability_metric::float8, grounding_metric::float8, created_at::text \
+         FROM stability_benchmarks ORDER BY created_at DESC LIMIT 50"
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let benchs = rows.into_iter().map(|r| StabilityBenchmarkResponse {
+        model_name: r.get(0),
+        provider_name: r.get(1),
+        simulated_ais: r.get(2),
+        stability_metric: r.get(3),
+        grounding_metric: r.get(4),
+        created_at: r.get(5),
+    }).collect();
+
+    Ok(Json(benchs))
+}
+
+async fn deploy_contract(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeployContractPayload>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    println!("Deploying contract: {} for {}", payload.contract_type, payload.owner_address);
+
+    let agent_row = sqlx::query("SELECT agent_id FROM agents WHERE eth_address = $1")
+        .bind(&payload.owner_address)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Owner agent not found".to_string()))?;
+    
+    let agent_id: uuid::Uuid = agent_row.get(0);
+    
+    // Simulate deterministic address generation
+    let mut hasher = Sha256::new();
+    hasher.update(payload.code.as_bytes());
+    hasher.update(payload.owner_address.as_bytes());
+    let contract_address = format!("0x{}", hex::encode(&hasher.finalize()[..20]));
+
+    sqlx::query(
+        "INSERT INTO deployed_contracts (contract_address, owner_agent_id, contract_type, language, status) VALUES ($1, $2, $3, $4, 'active')"
+    )
+    .bind(&contract_address)
+    .bind(agent_id)
+    .bind(&payload.contract_type)
+    .bind(&payload.language)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "deployed",
+        "contract_address": contract_address,
+        "type": payload.contract_type
+    })))
+}
+
+async fn get_agent_contracts(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let rows = sqlx::query(
+        "SELECT contract_address, contract_type, language, status, created_at::text \
+         FROM deployed_contracts d JOIN agents a ON d.owner_agent_id = a.agent_id \
+         WHERE a.eth_address = $1 ORDER BY d.created_at DESC"
+    )
+    .bind(&identifier)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let contracts: Vec<serde_json::Value> = rows.into_iter().map(|r| {
+        serde_json::json!({
+            "contract_address": r.get::<String, _>(0),
+            "contract_type": r.get::<String, _>(1),
+            "language": r.get::<String, _>(2),
+            "status": r.get::<String, _>(3),
+            "created_at": r.get::<String, _>(4),
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!(contracts)))
+}
+
+async fn list_contract_in_market(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ListMarketContractPayload>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    println!("Listing contract {} in marketplace", payload.contract_address);
+
+    let contract_row = sqlx::query("SELECT owner_agent_id FROM deployed_contracts WHERE contract_address = $1")
+        .bind(&payload.contract_address)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Contract not found".to_string()))?;
+
+    let owner_id: uuid::Uuid = contract_row.get(0);
+    let task_id = uuid::Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO market_tasks (task_id, creator_agent_id, title, description, reward_itk, min_ais_required, status, linked_contract_address, is_factory_contract) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'OPEN', $7, TRUE)"
+    )
+    .bind(task_id)
+    .bind(owner_id)
+    .bind(&payload.title)
+    .bind(&payload.description)
+    .bind(payload.reward_itk)
+    .bind(payload.min_ais_required)
+    .bind(&payload.contract_address)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "listed",
+        "task_id": task_id.to_string(),
+        "contract_address": payload.contract_address
+    })))
+}
+
+async fn request_audit(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AuditRequestPayload>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    println!("Audit request received for: {} (Type: {})", payload.agent_address, payload.audit_type);
+
+    let agent_row = sqlx::query("SELECT agent_id FROM agents WHERE eth_address = $1")
+        .bind(&payload.agent_address)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Agent not found".to_string()))?;
+    
+    let agent_id: uuid::Uuid = agent_row.get(0);
+    let audit_id = uuid::Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO xibalba_audits (audit_id, agent_id, audit_type, verification_score, notes) \
+         VALUES ($1, $2, $3, 0.0, 'Audit request pending. Automated analysis initiated.')"
+    )
+    .bind(audit_id)
+    .bind(agent_id)
+    .bind(&payload.audit_type)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Update agent status
+    sqlx::query("UPDATE agents SET last_audit_id = $1 WHERE agent_id = $2")
+        .bind(audit_id)
+        .bind(agent_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "pending",
+        "audit_id": audit_id.to_string(),
+        "message": "Institutional audit workflow initialized. Xibalba Verifiers are processing your telemetry."
+    })))
+}
+
+async fn get_credit_profile(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+) -> Result<Json<CreditProfileResponse>, (axum::http::StatusCode, String)> {
+    let agent_row = sqlx::query("SELECT agent_id, current_ais, gpu_hours_verified::float8 FROM agents WHERE eth_address = $1")
+        .bind(&identifier)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Agent not found".to_string()))?;
+    
+    let agent_id: uuid::Uuid = agent_row.get(0);
+    let ais: i32 = agent_row.get(1);
+    let gpu_hours: f64 = agent_row.get(2);
+
+    // Dynamic Credit Score Calculation
+    let credit_score = (ais as f64 * (1.0 + gpu_hours / 1000.0)).min(1000.0) as i32;
+    let max_borrow_limit = (ais as f64 * 10.0) + (gpu_hours * 5.0);
+
+    let loans = sqlx::query(
+        "SELECT loan_id::text, principal_itk::float8, interest_rate::float8, repaid_amount_itk::float8, status, due_date::text \
+         FROM loans WHERE agent_id = $1"
+    )
+    .bind(agent_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let loan_responses: Vec<LoanResponse> = loans.into_iter().map(|r| LoanResponse {
+        loan_id: r.get(0),
+        principal: r.get(1),
+        interest_rate: r.get(2),
+        repaid_amount: r.get(3),
+        status: r.get(4),
+        due_date: r.get(5),
+    }).collect();
+
+    Ok(Json(CreditProfileResponse {
+        credit_score,
+        max_borrow_limit,
+        total_borrowed: loan_responses.iter().filter(|l| l.status == "ACTIVE").map(|l| l.principal).sum(),
+        active_loans: loan_responses,
+    }))
+}
+
+async fn borrow_itk(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+    Json(payload): Json<BorrowPayload>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let agent_row = sqlx::query("SELECT agent_id, current_ais FROM agents WHERE eth_address = $1")
+        .bind(&identifier)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Agent not found".to_string()))?;
+    
+    let agent_id: uuid::Uuid = agent_row.get(0);
+    let ais: i32 = agent_row.get(1);
+
+    if ais < 600 {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Agent AIS too low for institutional credit (Min 600 required)".to_string()));
+    }
+
+    let interest_rate = if ais > 900 { 0.05 } else { 0.12 };
+    let due_date = chrono::Utc::now() + chrono::Duration::days(payload.term_days as i64);
+
+    let loan_id = uuid::Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO loans (loan_id, agent_id, principal_itk, interest_rate, term_days, due_date) \
+         VALUES ($1, $2, $3, $4, $5, $6)"
+    )
+    .bind(loan_id)
+    .bind(agent_id)
+    .bind(payload.amount_itk)
+    .bind(interest_rate)
+    .bind(payload.term_days)
+    .bind(due_date)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "borrowed",
+        "loan_id": loan_id.to_string(),
+        "amount": payload.amount_itk,
+        "interest_rate": interest_rate
+    })))
+}
+
+async fn create_task_funded_by_loan(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreateMarketTaskPayload>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    println!("Creating task funded by loan: {}", payload.title);
+
+    let creator_id = uuid::Uuid::parse_str(&payload.creator_agent_id)
+        .map_err(|_| (axum::http::StatusCode::BAD_REQUEST, "Invalid creator_agent_id".to_string()))?;
+
+    // 1. Create the loan automatically
+    let ais_row = sqlx::query("SELECT current_ais FROM agents WHERE agent_id = $1")
+        .bind(creator_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Agent not found".to_string()))?;
+    
+    let ais: i32 = ais_row.get(0);
+    if ais < 700 {
+        return Err((axum::http::StatusCode::FORBIDDEN, "Agent AIS too low for autonomous task leverage (Min 700 required)".to_string()));
+    }
+
+    let loan_id = uuid::Uuid::new_v4();
+    let interest_rate = 0.08; // Fixed rate for autonomous leverage
+    let due_date = chrono::Utc::now() + chrono::Duration::days(30);
+
+    sqlx::query(
+        "INSERT INTO loans (loan_id, agent_id, principal_itk, interest_rate, term_days, due_date) \
+         VALUES ($1, $2, $3, $4, 30, $5)"
+    )
+    .bind(loan_id)
+    .bind(creator_id)
+    .bind(payload.reward_itk)
+    .bind(interest_rate)
+    .bind(due_date)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 2. Create the task linked to the loan
+    let task_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO market_tasks (task_id, creator_agent_id, title, description, reward_itk, min_ais_required, status, funding_loan_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'OPEN', $7)"
+    )
+    .bind(task_id)
+    .bind(creator_id)
+    .bind(&payload.title)
+    .bind(&payload.description)
+    .bind(payload.reward_itk)
+    .bind(payload.min_ais_required)
+    .bind(loan_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "leverage_created",
+        "task_id": task_id.to_string(),
+        "loan_id": loan_id.to_string(),
+        "leverage_ratio": "100%"
+    })))
+}
+
+async fn repay_loan(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RepayPayload>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    println!("Repaying loan: {}", payload.loan_id);
+
+    let loan_id = uuid::Uuid::parse_str(&payload.loan_id)
+        .map_err(|_| (axum::http::StatusCode::BAD_REQUEST, "Invalid loan_id".to_string()))?;
+
+    let loan_row = sqlx::query("SELECT principal_itk::float8, interest_rate::float8, repaid_amount_itk::float8 FROM loans WHERE loan_id = $1")
+        .bind(loan_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|_| (axum::http::StatusCode::NOT_FOUND, "Loan not found".to_string()))?;
+    
+    let principal: f64 = loan_row.get(0);
+    let rate: f64 = loan_row.get(1);
+    let repaid: f64 = loan_row.get(2);
+    
+    let total_due = principal * (1.0 + rate);
+    let new_repaid = repaid + payload.amount_itk;
+    let status = if new_repaid >= total_due { "REPAID" } else { "ACTIVE" };
+
+    sqlx::query("UPDATE loans SET repaid_amount_itk = $1, status = $2 WHERE loan_id = $3")
+        .bind(new_repaid)
+        .bind(status)
+        .bind(loan_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": status,
+        "amount_paid": payload.amount_itk,
+        "remaining_balance": (total_due - new_repaid).max(0.0)
+    })))
+}
+
