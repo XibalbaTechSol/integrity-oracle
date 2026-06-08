@@ -1,6 +1,6 @@
 [package]
 name = "passport-verifier"
-version = "0.1.0"
+version = "1.0.0-rc1"
 edition = "2024"
 
 [dependencies]
@@ -9,7 +9,7 @@ axum = "0.7"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ethers = { version = "2.0", features = ["full"] }
+ethers = { version = "2.0", features = ["abigen", "rustls"] }
 hex = "0.4"
 dotenvy = "0.15"
 
