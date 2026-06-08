@@ -1,37 +1,40 @@
 // Xibalba Solutions: AIS v8.4 Privacy-First Verification Circuit (v1.0.0-rc1)
-// Proves an agent's reputation score is above a threshold without revealing the score.
-// Provides ZK-Edge Blinding for HIPAA-compliant PHI transactions in Xibalba Shield.
+// Proves an agent's reputation score and clearance level without revealing private data.
+// This is the generic Protocol Layer. Services like Xibalba Shield (Healthcare) 
+// utilize specific bits in the clearance_bitmask for specialized compliance (e.g., HIPAA).
 
 use dep::std;
 
 fn main(
-    ais_score: Field,               // Private Input: The actual score
+    ais_score: Field,               // Private Input: The actual score (0-1000)
     last_slash_days: Field,         // Private Input: Days since last slashing event
-    has_phi_clearance: bool,        // Private Input: Shield HIPAA clearance
+    clearance_bitmask: Field,       // Private Input: Bitmask of agent's held clearances
     merkle_index: Field,            // Private Input: Index in the Merkle tree
     merkle_path: [Field; 16],       // Private Input: Merkle path to the root (Tree depth 16)
-    ais_threshold: pub Field,       // Public Input: Required score for the deal (e.g., 750 for AAA)
-    max_risk_days: pub Field,       // Public Input: Required "clean" period
-    requires_phi_clearance: pub bool, // Public Input: Does the task involve PHI?
+    ais_threshold: pub Field,       // Public Input: Required score (e.g., 750 for Institutional)
+    max_risk_days: pub Field,       // Public Input: Required "clean" period (e.g., 30 days)
+    required_clearance_mask: pub Field, // Public Input: Bitmask of required clearances for task
     agent_address: pub Field,       // Public Input: To prevent proof replay
     state_root: pub Field           // Public Input: Merkle root of the Trust Vault
 ) {
-    // 1. ZK-Edge Blinding: Threshold Validation
+    // 1. Reputation Validation (Threshold)
     assert(ais_score as u32 >= ais_threshold as u32);
 
-    // 2. Shield HIPAA Moat: Clearance Validation
-    if requires_phi_clearance {
-        assert(has_phi_clearance == true);
-        // Implicitly enforce a high-trust floor for PHI
-        assert(ais_score as u32 >= 750); 
+    // 2. Programmable Gating: Clearance Validation
+    // Logic: (agent_mask & required_mask) == required_mask
+    // Note: Noir field bitwise ops are limited; we perform a simple check for matching bits.
+    if required_clearance_mask as u32 != 0 {
+        let agent_mask = clearance_bitmask as u32;
+        let req_mask = required_clearance_mask as u32;
+        assert((agent_mask & req_mask) == req_mask);
     }
 
     // 3. Risk Validation
     assert(last_slash_days as u32 >= max_risk_days as u32);
 
     // 4. Merkle Membership Proof
-    // We hash the leaf: hash(agent_address, ais_score, last_slash_days, has_phi_clearance)
-    let leaf = std::hash::pedersen_hash([agent_address, ais_score, last_slash_days, has_phi_clearance as Field]);
+    // We hash the leaf: hash(agent_address, ais_score, last_slash_days, clearance_bitmask)
+    let leaf = std::hash::pedersen_hash([agent_address, ais_score, last_slash_days, clearance_bitmask]);
     
     // Verify leaf exists in the tree with state_root
     let computed_root = std::merkle::compute_merkle_root(leaf, merkle_index, merkle_path);
