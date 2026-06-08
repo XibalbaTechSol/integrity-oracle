@@ -9,11 +9,11 @@ class TriMetricScoringEngine:
         self.MAX_SCORE = 1000
         
         # Component Weights for the Comprehensive Integrity Score (Total: 1.0)
-        self.W_TRUSTFLOW = 0.25     # Recursive inheritance (250 pts)
-        self.W_XIBALBA = 0.25       # Xibalba Verification (250 pts)
+        self.W_TRUSTFLOW = 0.30     # Recursive inheritance (300 pts)
+        self.W_XIBALBA = 0.30       # Xibalba Verification (300 pts)
         self.W_SACRIFICE = 0.20     # Compute hours/Sunk energy (200 pts)
-        self.W_STAKING_AGE = 0.15   # Staking + Longevity (150 pts)
-        self.W_VOLUME = 0.15        # Transaction Volume (150 pts)
+        self.W_STAKING_AGE = 0.10   # Staking + Longevity (100 pts)
+        self.W_VOLUME = 0.10        # Transaction Volume (100 pts)
         
     def calculate_entropy_score(self, performance_variance):
         """
