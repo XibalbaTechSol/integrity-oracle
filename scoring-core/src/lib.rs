@@ -130,4 +130,19 @@ mod tests {
         // Even with perfect metrics, Tier 1 should cap at 600
         assert_eq!(score, 600);
     }
+
+    #[test]
+    fn test_benchmark_latency() {
+        use std::time::Instant;
+        let engine = TriMetricScoringEngine::default();
+        let start = Instant::now();
+        for _ in 0..10000 {
+            let _ = engine.calculate_ais(
+                1000.0, 1.0, 1000.0, 1.0, 0.0, 1.0, 365.0, 1_000_000.0, 0.0, 0.0, 3
+            );
+        }
+        let elapsed = start.elapsed();
+        println!("LATENCY_NS: {}", elapsed.as_nanos());
+    }
 }
+
