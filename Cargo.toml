@@ -1,5 +1,7 @@
 [workspace]
 members = [
     "backend",
+    "oracle-core",
+    "passport-verifier",
 ]
 resolver = "2"
