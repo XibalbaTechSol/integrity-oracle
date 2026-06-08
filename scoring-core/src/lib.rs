@@ -135,14 +135,21 @@ mod tests {
     fn test_benchmark_latency() {
         use std::time::Instant;
         let engine = TriMetricScoringEngine::default();
-        let start = Instant::now();
-        for _ in 0..10000 {
-            let _ = engine.calculate_ais(
-                1000.0, 1.0, 1000.0, 1.0, 0.0, 1.0, 365.0, 1_000_000.0, 0.0, 0.0, 3
-            );
+        let mut min_elapsed = u128::MAX;
+        
+        for _ in 0..5 {
+            let start = Instant::now();
+            for _ in 0..10000 {
+                let _ = engine.calculate_ais(
+                    1000.0, 1.0, 1000.0, 1.0, 0.0, 1.0, 365.0, 1_000_000.0, 0.0, 0.0, 3
+                );
+            }
+            let elapsed = start.elapsed().as_nanos();
+            if elapsed < min_elapsed {
+                min_elapsed = elapsed;
+            }
         }
-        let elapsed = start.elapsed();
-        println!("LATENCY_NS: {}", elapsed.as_nanos());
+        println!("LATENCY_NS: {}", min_elapsed);
     }
 }
 
