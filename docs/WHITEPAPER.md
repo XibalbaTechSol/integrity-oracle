@@ -25,7 +25,7 @@ By 2028, over 40% of all online transactions are projected to be initiated by AI
 ## 3. Dual-Witness Architecture
 Integrity v3.0 implements a **Dual-Witness Architecture** to solve the throughput constraints of on-chain operations. All heavy telemetry computations and ZK proving are handled off-chain or at the edge, while state commitments and economic enforcement are finalized on-chain.
 
-1.  **Off-Chain Private Witness (The SDK):** Executes inside local enclaves (TEEs) at the edge, generating local **Aztec Noir UltraPlonk Zero-Knowledge Proofs (ZKPs)** proving telemetry correctness without exposing Protected Health Information (PHI) or proprietary IP.
+1.  **Off-Chain Private Witness (The SDK):** Executes inside local enclaves (TEEs) at the edge, generating local **Aztec Noir UltraPlonk Zero-Knowledge Proofs (ZKPs)** proving telemetry correctness without exposing private metadata or proprietary IP.
 2.  **Real-Time Validator (The Oracle):** A high-throughput Rust-based Axum server for telemetry ingestion and verification via C++ Barretenberg FFI, storing history in the PostgreSQL Trust Vault.
 3.  **On-Chain Anchor (The Smart Contracts):** Solidity contracts on Base L2 (`StateAnchor.sol`, `ReputationRegistry.sol`, `UltraPlonkVerifier.sol`) verify ZK proofs and update global reputations.
 
@@ -71,12 +71,12 @@ The **Integrity Token (ITK)** is the ERC-20 utility asset that fuels the trust e
 
 ---
 
-## 8. HIPAA & Regulatory Compliance
-The Integrity Protocol maps directly to HIPAA Technical Safeguards (45 CFR § 164.312):
-- **Access Control & Entity Authentication (§ 164.312(a)(1)):** Ensured via hardware-bound DIDs.
-- **Audit Controls (§ 164.312(b)):** Handled via `BCCCommitment` envelopes capturing the OPA evaluation logs.
-- **Integrity (§ 164.312(c)(1)):** Handled via `AuditShield.sol` and `SovereignAgent.sol` contracts.
-- **Transmission Security (§ 164.312(e)(1)):** Handled via local ZK proof generation, ensuring zero PHI leaks.
+## 8. Regulatory & Industry Compliance
+The Integrity Protocol is designed to map to various technical safeguards across industries (Healthcare, Finance, Government):
+- **Access Control & Entity Authentication:** Ensured via hardware-bound DIDs and cryptographic signatures.
+- **Audit Controls:** Handled via Behavioral Commitment Chain (BCC) envelopes capturing intent pre-execution.
+- **Integrity:** Handled via on-chain smart contracts that anchor behavioral commitments and reputation states.
+- **Transmission Security & Privacy:** Handled via local ZK proof generation and a generic \`clearance_bitmask\`, ensuring zero raw data leaks while proving compliance.
 
 ---
 © 2026 Xibalba Solutions. *Verification is the only path to finality.*

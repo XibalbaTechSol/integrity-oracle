@@ -68,19 +68,11 @@ pub struct TelemetryPayload {
     pub hardware_fingerprint: Option<String>,
     pub metadata: Option<serde_json::Value>,
 
-    // --- COMPLIANCE & GOVERNANCE (HIPAA/Finance) ---
-    #[serde(rename = "integrity.compliance.hipaa_eligible")]
-    pub hipaa_eligible: Option<bool>,
+    // --- COMPLIANCE & GOVERNANCE ---
+    #[serde(rename = "integrity.compliance.clearance_flags")]
+    pub clearance_flags: Option<u32>,
     #[serde(rename = "integrity.compliance.zdr_enabled")]
     pub zdr_enabled: Option<bool>,
-    #[serde(rename = "integrity.compliance.external_web_access")]
-    pub external_web_access: Option<bool>,
-    #[serde(rename = "integrity.compliance.data_residency_region")]
-    pub region: Option<String>,
-    #[serde(rename = "integrity.compliance.api_domain_prefix")]
-    pub api_domain_prefix: Option<String>,
-    #[serde(rename = "integrity.compliance.ekm_provider")]
-    pub ekm_provider: Option<String>,
 }
 
 
@@ -1318,8 +1310,8 @@ async fn ingest_telemetry(
 
     // 3. Write telemetry log to transaction_logs in Postgres (marked for Rollup)
     sqlx::query(
-        "INSERT INTO transaction_logs (agent_id, on_chain_tx_hash, contract_value_intg, success, completion_time_ms, data_quality_score, zk_proof_verified, burned_itk, rollup_status, hipaa_eligible, zdr_enabled, external_web_access, region, api_domain_prefix, ekm_provider) \
-         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, 'PENDING_ROLLUP', $9, $10, $11, $12, $13, $14)"
+        "INSERT INTO transaction_logs (agent_id, on_chain_tx_hash, contract_value_intg, success, completion_time_ms, data_quality_score, zk_proof_verified, burned_itk, rollup_status, clearance_flags, zdr_enabled) \
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, 'PENDING_ROLLUP', $9, $10)"
     )
     .bind(&agent_id_str)
     .bind(&integrity_hash)
@@ -1329,12 +1321,8 @@ async fn ingest_telemetry(
     .bind(accuracy_score as f64)
     .bind(zk_verified)
     .bind(burn_fee)
-    .bind(payload.hipaa_eligible)
+    .bind(payload.clearance_flags.map(|f| f as i32))
     .bind(payload.zdr_enabled)
-    .bind(payload.external_web_access)
-    .bind(payload.region.as_deref())
-    .bind(payload.api_domain_prefix.as_deref())
-    .bind(payload.ekm_provider.as_deref())
     .execute(&state.db)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
