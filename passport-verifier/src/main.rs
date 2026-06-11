@@ -1,24 +1,18 @@
-use axum::{
-    routing::{post},
-    Router,
-    Json,
-    http::StatusCode,
-};
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use ethers::types::{Address as EthersAddress, Signature};
-use ethers::signers::{LocalWallet, Signer};
-use std::str::FromStr;
+use axum::{Json, Router, http::StatusCode, routing::post};
 use dotenvy::dotenv;
+use ethers::signers::{LocalWallet, Signer};
+use ethers::types::{Address as EthersAddress, Signature};
+use serde::{Deserialize, Serialize};
 use std::env;
+use std::net::SocketAddr;
+use std::str::FromStr;
 
 #[tokio::main]
 async fn main() {
     // Load environment variables from .env file
     dotenv().ok();
 
-    let app = Router::new()
-        .route("/verify_passport", post(verify_passport_handler));
+    let app = Router::new().route("/verify_passport", post(verify_passport_handler));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Passport Verifier listening on {}", addr);
@@ -39,7 +33,9 @@ struct VerifyResponse {
     error: Option<String>,
 }
 
-async fn verify_passport_handler(Json(payload): Json<VerifyRequest>) -> (StatusCode, Json<VerifyResponse>) {
+async fn verify_passport_handler(
+    Json(payload): Json<VerifyRequest>,
+) -> (StatusCode, Json<VerifyResponse>) {
     let address = match EthersAddress::from_str(&payload.address) {
         Ok(addr) => addr,
         Err(_) => {
@@ -70,12 +66,18 @@ async fn verify_passport_handler(Json(payload): Json<VerifyRequest>) -> (StatusC
     };
 
     // --- 2. Check Score Threshold ---
-    let required_score: u32 = env::var("PASSPORT_SCORE_THRESHOLD").unwrap_or("25".to_string()).parse().unwrap_or(25);
+    let required_score: u32 = env::var("PASSPORT_SCORE_THRESHOLD")
+        .unwrap_or("25".to_string())
+        .parse()
+        .unwrap_or(25);
     if passport_score < required_score {
         return (
             StatusCode::FORBIDDEN,
             Json(VerifyResponse {
-                message: format!("Passport score of {} is below the required threshold of {}.", passport_score, required_score),
+                message: format!(
+                    "Passport score of {} is below the required threshold of {}.",
+                    passport_score, required_score
+                ),
                 signature: None,
                 error: Some("score_too_low".to_string()),
             }),
@@ -111,7 +113,10 @@ async fn verify_passport_handler(Json(payload): Json<VerifyRequest>) -> (StatusC
 /// Placeholder function to simulate querying the Gitcoin Passport API.
 /// In a real implementation, this would involve making an HTTP request.
 async fn query_gitcoin_passport(address: EthersAddress) -> Result<u32, String> {
-    println!("Simulating Gitcoin Passport check for address: {:?}", address);
+    println!(
+        "Simulating Gitcoin Passport check for address: {:?}",
+        address
+    );
     // In a real implementation, you would use `reqwest` to call:
     // let url = format!("https://api.scorer.gitcoin.co/registry/score/{}/{}", SCORER_ID, address);
     // let client = reqwest::Client::new();
@@ -127,13 +132,17 @@ async fn create_eip712_attestation(address: EthersAddress) -> Result<Signature, 
     // and would involve defining the domain and typed data structure.
     // We will sign a simple hash for this boilerplate.
 
-    let private_key_hex = env::var("VERIFIER_PRIVATE_KEY").map_err(|_| "VERIFIER_PRIVATE_KEY not set".to_string())?;
+    let private_key_hex =
+        env::var("VERIFIER_PRIVATE_KEY").map_err(|_| "VERIFIER_PRIVATE_KEY not set".to_string())?;
     let wallet: LocalWallet = private_key_hex
         .parse()
         .map_err(|_| "Failed to parse private key".to_string())?;
 
     let message = format!("Attesting passport for address: {:?}", address);
-    let signature = wallet.sign_message(message.as_bytes()).await.map_err(|e| e.to_string())?;
+    let signature = wallet
+        .sign_message(message.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(signature)
 }

@@ -24,7 +24,10 @@ impl MerkleTree {
             current_level = next_level;
         }
 
-        Self { leaves: tree[0].clone(), tree }
+        Self {
+            leaves: tree[0].clone(),
+            tree,
+        }
     }
 
     pub fn get_root(&self) -> [u8; 32] {

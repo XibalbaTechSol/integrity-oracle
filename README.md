@@ -1,47 +1,61 @@
-# 🏛️ Xibalba Integrity Sovereign Protocol (Unified Monorepo)
+# Integrity Oracle: The Foundational Trust Engine
 
-The comprehensive, institutional-grade infrastructure for AI Agent Trust, Reputation, and Verification.
+The Integrity Oracle is the high-performance, domain-agnostic Layer 0 infrastructure for AI agent trust, reputation, and cryptographic verification within the Integrity Protocol ecosystem.
 
----
-
-## 📦 Project Structure
-
-This monorepo consolidates the entire Integrity ecosystem:
-
-### ⚙️ Core Engines
-- **[/backend](./backend)**: The Protocol Orchestrator. Handles AIS scoring, Identity (DID/XNS), and protocol logic.
-- **[/oracle-core](./oracle-core)**: The high-performance ZK-proof verification engine (Rust/Axum + Barretenberg FFI).
-- **[/passport-verifier](./passport-verifier)**: Specialized verification service for agent "passports".
-
-### ⛓️ Blockchain & Proofs
-- **[/contracts](./contracts)**: Solidity smart contracts for Base L2 (IntegrityToken, StateAnchor, ReputationRegistry).
-- **[/circuits](./circuits)**: Aztec Noir ZK circuits for telemetry and reputation proofs.
-
-### 🌐 Infrastructure & Documentation
-- **[/gateway](./gateway)**: Nginx mTLS gateway for zero-trust API access.
-- **[/docs](./docs)**: System-wide architecture, whitepapers, and roadmap.
-- **[WIKI.md](./WIKI.md)**: Deep technical reference.
+## Overview
+As the core truth engine, the Oracle is responsible for:
+- **ZK-Proof Verification**: Authenticating telemetry using Aztec Noir circuits and the Barretenberg backend.
+- **AIS Scoring**: Computing and anchoring Agent Integrity Scores (AIS).
+- **L2 Anchoring**: Periodically rolling up state to Base L2 for immutable auditing.
 
 ---
 
-## ⚡ Quickstart
+## 🏗️ Architecture
 
-1. **Start the Oracle Core**:
+The Oracle is organized into specialized, high-performance components:
+
+### Core Components
+- **`oracle-core/`**: High-performance Rust verification engine utilizing FFI for native ZK-proof verification.
+- **`backend/`**: Protocol orchestrator managing telemetry ingestion, AIS scoring, and state anchoring.
+- **`circuits/`**: Aztec Noir ZK circuits for telemetry integrity and reputation scoring.
+- **`passport-verifier/`**: Service for verifying cryptographic agent "passports".
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+- [Rust](https://rustup.rs/)
+- [Foundry](https://book.getfoundry.sh/) (for contract interactions)
+
+### Running Core Services
+1. **Oracle Engine:**
    ```bash
-   cd oracle-core && cargo run
+   cd oracle-core
+   cargo run
+   ```
+2. **Protocol Backend:**
+   ```bash
+   cd backend
+   cargo run
    ```
 
-2. **Start the Protocol Backend**:
-   ```bash
-   cd backend && cargo run
-   ```
+---
 
-3. **Deploy Contracts (Local)**:
-   ```bash
-   cd contracts && npm install && npx hardhat node
-   ```
+## 🛠️ Infrastructure Requirements
+- **Database**: PostgreSQL 15+ required for backend telemetry storage.
+- **FFI**: Native Barretenberg binaries must be accessible for the `oracle-core` FFI verification to function.
+
+## 🛠️ Troubleshooting
+- **Build Errors**: Ensure `sqlx-cli` is installed to manage database migrations.
+- **FFI Errors**: Verify that the Barretenberg static library (`libbb_rs.a`) is correctly linked in your system path.
+
+---
+
+## 🤝 Contribution Guidelines
+Contributions follow the standard Rust community standards. Please run `cargo fmt` and `cargo test` before submitting PRs.
 
 ---
 
 ## 📜 License
-MIT License. Built for institutional stability. Engineering the future of AI trust.
+This project is licensed under the **Apache License 2.0**.

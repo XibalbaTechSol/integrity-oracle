@@ -1,4 +1,4 @@
-# Technical Architecture — Integrity Protocol (v3.0)
+# Technical Architecture — Integrity Protocol (v3.1)
 
 > **ZK-Rollup · Rust Oracle · ERC-4337 Paymaster · Chainlink CCIP**
 > 
@@ -8,7 +8,7 @@
 
 ## 1. The Dual-Witness Model
 
-Integrity v3.0 introduces a **Dual-Witness** architecture that decouples high-frequency off-chain behavior from low-frequency on-chain economic finality. All heavy computation stays off-chain in the Rust Oracle; only cryptographic proofs and economic events are anchored on-chain.
+Integrity v3.1 introduces a **Dual-Witness** architecture that decouples high-frequency off-chain behavior from low-frequency on-chain economic finality. All heavy computation stays off-chain in the Rust Oracle; only cryptographic proofs and economic events are anchored on-chain.
 
 ```
                 ┌─────────────────────────────────┐
@@ -27,7 +27,8 @@ Integrity v3.0 introduces a **Dual-Witness** architecture that decouples high-fr
                 │     Integrity Oracle (Rust Core)│
                 │  • Tri-Metric AIS Scoring       │
                 │  • ZK-Proof Verification        │
-                │  • ERC-4337 Paymaster Sponsor   │
+                │  • BCC Commitment Registry      │
+                │  • Namespaced Multi-Tenancy     │
                 └────────┬──────────────┬──────────┘
                          │              │
               ┌──────────▼───┐    ┌─────▼──────────────┐
@@ -35,7 +36,7 @@ Integrity v3.0 introduces a **Dual-Witness** architecture that decouples high-fr
               │  Trust Vault │    │  • StateAnchor.sol  │
               │  (Agents,    │    │  • RepRegistry.sol  │
               │  Rollups,    │    │  • ZKVerifier.sol   │
-              │  Claims)     │    │  • CCIPBridge.sol   │
+              │  Commitments)│    │  • CCIPBridge.sol   │
               └──────────────┘    └─────────────────────┘
 ```
 
@@ -46,19 +47,20 @@ Integrity v3.0 introduces a **Dual-Witness** architecture that decouples high-fr
 ### 2.1 Layer 1: Off-Chain Private Witness (The SDK)
 The Universal SDK acts as the primary observer at the edge:
 - **ZK-Edge Proving**: Generates local **Aztec Noir SNARKs** proving that telemetry metrics (Entropy, Grounding) were calculated correctly without leaking sensitive prompt/completion data.
+- **BCC Commitment**: Agents must cryptographically commit to their intended action (e.g., "Analyze HIPAA Record") *before* execution.
 - **Hardware-Anchored DID**: Every agent identity is deterministically bound to the host machine's hardware ID via `did:xibalba`.
-- **Background Sync**: Telemetry is buffered and flushed asynchronously via a multi-threaded worker to ensure zero impact on inference latency.
 
 ### 2.2 Layer 2: Real-Time Validator (The Oracle)
 The Oracle operates a hybrid engine:
 - **Rust Core (Engine)**: High-throughput Axum server for sub-millisecond telemetry ingestion and PostgreSQL persistence.
-- **Python Sidecar (Bridge)**: Manages periodic state rollups (Merkle trees), Chainlink CCIP messaging, and ERC-4337 paymaster authorization.
-- **Reputation Engine**: Calculates the **Agent Integrity Score (AIS)** using the Tri-Metric algorithm, weighted by on-chain stake and institutional verification.
+- **Namespaced Telemetry**: Supports multi-tenancy via `domain_id` (e.g., `shield`, `quant`), allowing vertical services to isolate their data while feeding a global AIS.
+- **State Anchor Daemon**: A background worker that periodically batches transaction hashes into a Merkle Tree and prepares the root for on-chain anchoring.
+- **Identity Issuance**: Issues signed W3C Verifiable Credentials (VCs) that encapsulate an agent's AIS and trust grade for offline verification.
 
 ### 2.3 Layer 3: On-Chain Anchor (The Smart Contracts)
 - **Mathematical Enforcement**: `UltraPlonkVerifier.sol` ensures that AIS updates on-chain are mathematically proven by the SDK.
+- **Immutable Audit Trail**: `StateAnchor.sol` stores periodic Merkle roots, providing cryptographic finality for the off-chain Trust Vault ledger.
 - **Gas Abstraction**: `IntegrityPaymaster.sol` sponsors transactions for agents with an **AIS > 600**, enabling a frictionless, zero-gas onboarding experience.
-- **Omnichain Portability**: `CCIPReputationBridge.sol` synchronizes AIS scores across EVM networks using Chainlink's Interoperability Protocol.
 
 ---
 
@@ -85,5 +87,5 @@ The AIS (0–1000 bps) is the "FICO Score" for AI agents, derived from three beh
 
 ---
 
-*Integrity Protocol v3.0 — Xibalba AI Solutions*
+*Integrity Protocol v3.1 — Xibalba AI Solutions*
 *"Privacy-First. Mathematically Certain. Omnichain Sovereign."*

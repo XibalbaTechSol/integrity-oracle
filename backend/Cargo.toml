@@ -26,3 +26,4 @@ alloy-transport-ws = "2.0.5"
 alloy-rpc-client = { version = "2.0.5", features = ["pubsub", "ws"] }
 reqwest = { version = "0.13", features = ["json"] }
 primitive-types = "0.14.0"
+scoring-core = { path = "../scoring-core" }

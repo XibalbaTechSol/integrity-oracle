@@ -1091,6 +1091,7 @@ dependencies = [
  "k256",
  "primitive-types 0.14.0",
  "reqwest 0.13.4",
+ "scoring-core",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -4023,10 +4024,12 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 name = "oracle"
 version = "1.0.0-rc1"
 dependencies = [
+ "async-trait",
  "axum 0.8.9",
  "base64 0.21.7",
  "bb_rs",
  "cc",
+ "chrono",
  "ed25519-dalek",
  "hex",
  "hmac",
@@ -4037,6 +4040,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "tokio",
+ "uuid 1.23.2",
 ]
 
 [[package]]

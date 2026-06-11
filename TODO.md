@@ -60,3 +60,27 @@ This document outlines the tasks for Phase 1 of backend feature implementation, 
 
 ### 13. Daily Snapshot Cron — AIS History Writer
 - [x] Implemented as part of `process_new_transaction` and `process_telemetry_batch` in `data_ingestor.py`.
+
+## Phase 4: Architectural Generalization & Multi-Tenancy
+
+### 14. Multi-Tenant `domain_id` Backend Integration
+- [x] Update `TelemetryPayload` and `HandshakePayload` to include `domain_id`.
+- [x] Enforce domain-specific isolation in `transaction_logs` and `provenance_logs` queries.
+- [x] Add `domain_id` filtering to the Ledger and Leaderboard endpoints.
+
+### 15. Scoring Policy Abstraction
+- [x] Decouple AIS calculation logic from `scoring_engine.rs`.
+- [x] Implement a `ScoringPolicy` registry that allows different formulas per `domain_id`.
+- [x] Support externalized weights for Entropy, Grounding, and Sacrifice via database config.
+
+### 16. Standardized Ingestion Envelope
+- [x] Refactor telemetry ingest to use a "Standard Envelope" (Header + Generic JSONB Payload).
+- [x] Implement a "Payload Dispatcher" that routes domain-specific data to vertical-aware processors.
+
+### 17. Reactive Webhook & Event System
+- [x] Implement an internal Event Bus for system-wide notifications (AIS updates, Slashing).
+- [x] Create a `WebhookService` allowing vertical frameworks to subscribe to specific agent events.
+
+### 18. Omnichain Reputation Propagation (CCIP)
+- [ ] Integrate Chainlink CCIP in the `rollup_daemon` to sync AIS scores across L2s.
+- [ ] Implement a cross-chain `ReputationOracle` contract to receive and verify AIS state roots.

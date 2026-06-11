@@ -55,44 +55,44 @@ impl TriMetricScoringEngine {
     ) -> u32 {
         let entropy_score = self.calculate_entropy_score(performance_variance);
         let stability_drag = entropy_score / self.max_score;
-        
+
         let grounding_boost = 1.0 + (hgi_raw * 0.2);
-        
+
         let trustflow_idx = (avg_partner_ais / 1000.0).min(1.0);
         let audit_idx = xibalba_audit_score.max(0.0).min(1.0);
-        
+
         // Logarithmic scale (1000 hours = 1.0)
         let sacrifice_idx = ((gpu_hours_verified + 1.0).log10() / 3.0).min(1.0);
-        
+
         // Age (~365 days = 1.0)
         let age_idx = ((agent_age_days + 1.0).log10() / 2.56).min(1.0);
         let staking_age_idx = (0.5 * staked_ratio) + (0.5 * age_idx);
-        
+
         // Volume: Logarithmic (1M ITK = 1.0)
         let volume_idx = ((total_volume_intg + 1.0).log10() / 6.0).min(1.0);
-        
-        let base_integrity = (self.w_trustflow * trustflow_idx) +
-            (self.w_xibalba * audit_idx) +
-            (self.w_sacrifice * sacrifice_idx) +
-            (self.w_staking_age * staking_age_idx) +
-            (self.w_volume * volume_idx);
-            
+
+        let base_integrity = (self.w_trustflow * trustflow_idx)
+            + (self.w_xibalba * audit_idx)
+            + (self.w_sacrifice * sacrifice_idx)
+            + (self.w_staking_age * staking_age_idx)
+            + (self.w_volume * volume_idx);
+
         let correlated_integrity = base_integrity * stability_drag * grounding_boost;
-        
+
         // Decays & Penalties
         // Prevent denominator issue identified in the audit
-        let penalty_multiplier = (1.0 - penalty_points).max(0.0); 
+        let penalty_multiplier = (1.0 - penalty_points).max(0.0);
         let temporal_decay = (-0.005 * days_since_active).exp();
-        
+
         let final_ais = correlated_integrity * self.max_score * penalty_multiplier * temporal_decay;
-        
+
         // Enforce Identity Ceiling
         let ceiling = match verification_tier {
             3 => 1000.0,
             2 => 850.0,
             _ => 600.0,
         };
-        
+
         final_ais.min(ceiling).round() as u32
     }
 }
@@ -105,7 +105,17 @@ mod tests {
     fn test_perfect_tier3_agent() {
         let engine = TriMetricScoringEngine::default();
         let score = engine.calculate_ais(
-            1000.0, 1.0, 1000.0, 1.0, 0.0, 1.0, 365.0, 1_000_000.0, 0.0, 0.0, 3
+            1000.0,
+            1.0,
+            1000.0,
+            1.0,
+            0.0,
+            1.0,
+            365.0,
+            1_000_000.0,
+            0.0,
+            0.0,
+            3,
         );
         assert!(score > 950);
         assert!(score <= 1000);
@@ -116,16 +126,36 @@ mod tests {
         let engine = TriMetricScoringEngine::default();
         // High penalty should drop score to 0 cleanly without underflow
         let score = engine.calculate_ais(
-            1000.0, 1.0, 1000.0, 1.0, 0.0, 1.0, 365.0, 1_000_000.0, 0.0, 1.5, 3
+            1000.0,
+            1.0,
+            1000.0,
+            1.0,
+            0.0,
+            1.0,
+            365.0,
+            1_000_000.0,
+            0.0,
+            1.5,
+            3,
         );
         assert_eq!(score, 0);
     }
-    
+
     #[test]
     fn test_ceiling_enforcement() {
         let engine = TriMetricScoringEngine::default();
         let score = engine.calculate_ais(
-            1000.0, 1.0, 1000.0, 1.0, 0.0, 1.0, 365.0, 1_000_000.0, 0.0, 0.0, 1
+            1000.0,
+            1.0,
+            1000.0,
+            1.0,
+            0.0,
+            1.0,
+            365.0,
+            1_000_000.0,
+            0.0,
+            0.0,
+            1,
         );
         // Even with perfect metrics, Tier 1 should cap at 600
         assert_eq!(score, 600);
@@ -136,12 +166,22 @@ mod tests {
         use std::time::Instant;
         let engine = TriMetricScoringEngine::default();
         let mut min_elapsed = u128::MAX;
-        
+
         for _ in 0..5 {
             let start = Instant::now();
             for _ in 0..10000 {
                 let _ = engine.calculate_ais(
-                    1000.0, 1.0, 1000.0, 1.0, 0.0, 1.0, 365.0, 1_000_000.0, 0.0, 0.0, 3
+                    1000.0,
+                    1.0,
+                    1000.0,
+                    1.0,
+                    0.0,
+                    1.0,
+                    365.0,
+                    1_000_000.0,
+                    0.0,
+                    0.0,
+                    3,
                 );
             }
             let elapsed = start.elapsed().as_nanos();
@@ -152,4 +192,3 @@ mod tests {
         println!("LATENCY_NS: {}", min_elapsed);
     }
 }
-
